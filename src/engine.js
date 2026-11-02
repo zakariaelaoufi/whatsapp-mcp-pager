@@ -172,17 +172,23 @@ export class ApprovalEngine {
    * @param {import('./providers/interface.js').NotificationProvider} options.provider
    * @param {number} [options.escalationTimeoutMs]
    * @param {string} [options.quietHours]
+   * @param {number} [options.reminderCounter]
+   * @param {number} [options.countdownTickMs]
    */
   constructor({
     store,
     provider,
     escalationTimeoutMs = config.escalationTimeoutMs,
     quietHours = config.quietHours,
+    reminderCounter = config.reminderCounter,
+    countdownTickMs = 1000,
   }) {
     this.store = store;
     this.provider = provider;
     this.escalationTimeoutMs = escalationTimeoutMs;
     this.quietHours = quietHours;
+    this.reminderCounter = Math.max(0, Number(reminderCounter) || 0);
+    this.countdownTickMs = Math.max(1, Number(countdownTickMs) || 1000);
 
     /** @type {Map<string, { escalationTimer?: NodeJS.Timeout, expirationTimer?: NodeJS.Timeout, wakeUpAbort?: AbortController, resolvers: Set<(res: object) => void> }>} */
     this.activeTrackers = new Map();
@@ -340,6 +346,99 @@ export class ApprovalEngine {
   }
 
   /**
+   * Runs the per-request countdown (`REMINDER_COUNTER` down to `0`) before dispatching a WhatsApp notification.
+   * If the request is aborted or resolved on screen before the counter hits `0`, no WhatsApp notification is sent.
+   *
+   * @param {string} requestId
+   * @param {object} [options]
+   * @param {AbortSignal} [options.signal]
+   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number, remainingCountdown?: number }) => void} [options.onHeartbeat]
+   * @returns {Promise<{ shouldNotify: boolean, request?: object }>}
+   */
+  async _waitForRequestCountdown(requestId, { signal, onHeartbeat } = {}) {
+    if (this.reminderCounter <= 0) {
+      return { shouldNotify: true };
+    }
+
+    let remaining = this.reminderCounter;
+    let elapsedTicks = 0;
+
+    while (remaining > 0) {
+      if (signal?.aborted) {
+        const current = this.store.getRequest(requestId);
+        if (current && !TERMINAL_STATES.has(current.state)) {
+          const { request: abortedReq } = this.store.transitionState({
+            requestId,
+            toState: STATES.REJECTED,
+            decision: STATES.REJECTED,
+            humanInstructions: `Cancelled on screen before countdown reached 0 (${remaining}/${this.reminderCounter} remaining).`,
+            channel: 'screen',
+            eventType: 'COUNTDOWN_CANCELLED_BEFORE_ZERO',
+          });
+          return { shouldNotify: false, request: abortedReq };
+        }
+        return { shouldNotify: false, request: current };
+      }
+
+      const current = this.store.getRequest(requestId);
+      if (!current || TERMINAL_STATES.has(current.state)) {
+        return { shouldNotify: false, request: current };
+      }
+
+      await new Promise((resolve) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, this.countdownTickMs);
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+
+      if (signal?.aborted) {
+        continue;
+      }
+
+      remaining -= 1;
+      elapsedTicks += 1;
+
+      console.error(
+        `[Countdown] [${requestId}] Counter=${remaining}/${this.reminderCounter} before sending WhatsApp reminder...`
+      );
+
+      if (typeof onHeartbeat === 'function') {
+        try {
+          onHeartbeat({
+            requestId,
+            state: STATES.PENDING,
+            elapsedSeconds: elapsedTicks,
+            remainingCountdown: remaining,
+          });
+        } catch {
+          // Ignore heartbeat callback errors
+        }
+      }
+    }
+
+    const afterCountdown = this.store.getRequest(requestId);
+    if (!afterCountdown || TERMINAL_STATES.has(afterCountdown.state)) {
+      return { shouldNotify: false, request: afterCountdown };
+    }
+
+    this.store.logAudit({
+      requestId,
+      eventType: 'COUNTDOWN_REACHED_ZERO',
+      fromState: STATES.PENDING,
+      toState: STATES.PENDING,
+      details: { reminderCounter: this.reminderCounter },
+    });
+
+    return { shouldNotify: true };
+  }
+
+  /**
    * Creates, dispatches, and waits for a formal approval request.
    *
    * @param {object} params
@@ -349,7 +448,8 @@ export class ApprovalEngine {
    * @param {string} params.spokenPrompt
    * @param {'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'} [params.riskLevel]
    * @param {number} [params.timeoutSeconds]
-   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number }) => void} [params.onHeartbeat]
+   * @param {AbortSignal} [params.signal]
+   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number, remainingCountdown?: number }) => void} [params.onHeartbeat]
    * @returns {Promise<{ request_id: string, final_state: string, decision: string, human_instructions: string, channel: string }>}
    */
   async requestApproval({
@@ -359,6 +459,7 @@ export class ApprovalEngine {
     spokenPrompt,
     riskLevel = 'HIGH',
     timeoutSeconds = 600,
+    signal,
     onHeartbeat,
   }) {
     const redactedCommandOrDiff = redactSecrets(commandOrDiff);
@@ -374,6 +475,15 @@ export class ApprovalEngine {
       riskLevel,
       timeoutSeconds,
     });
+
+    // 1b. Per-request countdown: decrement from REMINDER_COUNTER down to 0 before sending WhatsApp reminder
+    const countdownResult = await this._waitForRequestCountdown(req.request_id, {
+      signal,
+      onHeartbeat,
+    });
+    if (!countdownResult.shouldNotify) {
+      return toResultPayload(countdownResult.request || this.store.getRequest(req.request_id));
+    }
 
     const formattedText = formatApprovalMessage({
       requestId: req.request_id,
@@ -497,6 +607,7 @@ export class ApprovalEngine {
     question,
     spokenPrompt,
     timeoutSeconds = 600,
+    signal,
     onHeartbeat,
   }) {
     const redactedQuestion = redactSecrets(question);
@@ -510,6 +621,14 @@ export class ApprovalEngine {
       riskLevel: 'LOW',
       timeoutSeconds,
     });
+
+    const countdownResult = await this._waitForRequestCountdown(req.request_id, {
+      signal,
+      onHeartbeat,
+    });
+    if (!countdownResult.shouldNotify) {
+      return toResultPayload(countdownResult.request || this.store.getRequest(req.request_id));
+    }
 
     const formattedText = formatHumanInputMessage({
       requestId: req.request_id,

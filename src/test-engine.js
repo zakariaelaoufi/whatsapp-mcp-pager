@@ -5,7 +5,7 @@ import { MockProvider } from './providers/mock.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function createTestHarness({ escalationTimeoutMs = 5000 } = {}) {
+function createTestHarness({ escalationTimeoutMs = 5000, reminderCounter = 0, countdownTickMs = 20 } = {}) {
   const store = createDatabase(':memory:');
   const provider = new MockProvider({ allowedSenderId: '14155552671@c.us' });
   const engine = new ApprovalEngine({
@@ -13,6 +13,8 @@ function createTestHarness({ escalationTimeoutMs = 5000 } = {}) {
     provider,
     escalationTimeoutMs,
     quietHours: '',
+    reminderCounter,
+    countdownTickMs,
   });
   return { store, provider, engine };
 }
@@ -309,7 +311,78 @@ async function runTests() {
     );
   }
 
-  console.error('\n🎉 All 7 Fail-Closed HITL Engine specifications passed deterministically!');
+  // ---------------------------------------------------------------------------
+  // Test 8: Per-request REMINDER_COUNTER decrements (3 -> 2 -> 1 -> 0) before dispatching WhatsApp
+  // ---------------------------------------------------------------------------
+  {
+    const { store, provider, engine } = createTestHarness({
+      reminderCounter: 3,
+      countdownTickMs: 25,
+    });
+
+    const countdownTicks = [];
+    const approvalPromise = engine.requestApproval({
+      project: 'inventory-service',
+      summary: 'Run production migration',
+      commandOrDiff: 'npm run migrate',
+      spokenPrompt: 'Should I run the migration?',
+      riskLevel: 'LOW',
+      onHeartbeat: ({ remainingCountdown }) => {
+        if (remainingCountdown !== undefined) {
+          countdownTicks.push(remainingCountdown);
+        }
+      },
+    });
+
+    // While countdown is still > 0 (e.g. after 30ms, only 1 tick elapsed -> counter at 2), WhatsApp must NOT be sent yet
+    await sleep(30);
+    assert.equal(
+      provider.sentPrompts.length,
+      0,
+      'WhatsApp reminder must NOT be sent while per-request countdown is still > 0'
+    );
+
+    // Wait for countdown to finish (3 ticks * 25ms = 75ms total)
+    await sleep(65);
+    assert.deepEqual(countdownTicks, [2, 1, 0], 'Counter must decrement 3 -> 2 -> 1 -> 0');
+    assert.equal(
+      provider.sentPrompts.length,
+      1,
+      'WhatsApp reminder must be dispatched once countdown reaches 0'
+    );
+
+    await provider.simulateInbound({ channel: 'text', text: 'Y' });
+    const res = await approvalPromise;
+    assert.equal(res.final_state, STATES.APPROVED);
+
+    // Also verify that if cancelled on screen before countdown reaches 0, WhatsApp is never sent
+    const abortController = new AbortController();
+    const cancelledPromise = engine.requestApproval({
+      project: 'inventory-service',
+      summary: 'Cancelled on screen',
+      commandOrDiff: 'echo test',
+      spokenPrompt: 'Cancelled on screen',
+      riskLevel: 'LOW',
+      signal: abortController.signal,
+    });
+    await sleep(25);
+    abortController.abort();
+    const cancelledRes = await cancelledPromise;
+    assert.equal(cancelledRes.final_state, STATES.REJECTED);
+    assert.equal(
+      provider.sentPrompts.length,
+      1,
+      'Aborted request before countdown hits 0 must never send WhatsApp'
+    );
+
+    await engine.destroy();
+    store.close();
+    console.error(
+      '✅ 8. Per-request REMINDER_COUNTER decrements (3 -> 2 -> 1 -> 0) and only sends WhatsApp when wait exceeds countdown'
+    );
+  }
+
+  console.error('\n🎉 All 8 Fail-Closed HITL Engine specifications passed deterministically!');
 }
 
 runTests().catch((err) => {

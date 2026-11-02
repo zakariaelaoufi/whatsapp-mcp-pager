@@ -18,6 +18,7 @@ const engine = new ApprovalEngine({
   provider,
   escalationTimeoutMs: config.escalationTimeoutMs,
   quietHours: config.quietHours,
+  reminderCounter: config.reminderCounter,
 });
 
 const server = new McpServer({
@@ -29,8 +30,12 @@ const server = new McpServer({
  * Helper to create a 15-second MCP progress notification emitter for long-running HITL waits.
  */
 function createProgressHeartbeatHandler(extra, totalSeconds = 600) {
-  return async ({ requestId, state, elapsedSeconds }) => {
-    console.error(`[MCP Heartbeat] Waiting on [${requestId}] (state=${state}, elapsed=${elapsedSeconds}s)`);
+  return async ({ requestId, state, elapsedSeconds, remainingCountdown }) => {
+    const msg =
+      remainingCountdown !== undefined
+        ? `[${requestId}] Countdown: ${remainingCountdown}s before sending WhatsApp reminder...`
+        : `Waiting for WhatsApp response on [${requestId}] (${state}, ${elapsedSeconds}s elapsed)...`;
+    console.error(`[MCP Heartbeat] ${msg}`);
     const progressToken = extra?._meta?.progressToken;
     if (progressToken !== undefined && typeof extra?.sendNotification === 'function') {
       try {
@@ -40,7 +45,7 @@ function createProgressHeartbeatHandler(extra, totalSeconds = 600) {
             progressToken,
             progress: elapsedSeconds,
             total: totalSeconds,
-            message: `Waiting for WhatsApp response on [${requestId}] (${state}, ${elapsedSeconds}s elapsed)...`,
+            message: msg,
           },
         });
       } catch (err) {
@@ -93,6 +98,7 @@ server.tool(
         spokenPrompt: spoken_prompt,
         riskLevel: risk_level,
         timeoutSeconds: timeout_seconds,
+        signal: extra?.signal,
         onHeartbeat: createProgressHeartbeatHandler(extra, timeout_seconds),
       });
 
@@ -195,6 +201,7 @@ server.tool(
         question,
         spokenPrompt: spoken_prompt,
         timeoutSeconds: 600,
+        signal: extra?.signal,
         onHeartbeat: createProgressHeartbeatHandler(extra, 600),
       });
 

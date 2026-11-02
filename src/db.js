@@ -31,6 +31,8 @@ export const ACTIVE_WAITING_STATES = new Set([
 export const ALLOWED_TRANSITIONS = Object.freeze({
   [STATES.PENDING]: new Set([
     STATES.NOTIFIED,
+    STATES.APPROVED,
+    STATES.REJECTED,
     STATES.DELIVERY_FAILED,
     STATES.EXPIRED,
   ]),
@@ -59,6 +61,15 @@ export function generateRequestId() {
 }
 
 /**
+ * Formats a Unix millisecond timestamp as a human-readable `YYYY-MM-DD HH:MM:SS` string in local time.
+ */
+export function formatTimestamp(ms = Date.now()) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/**
  * Creates and initializes a SQLite persistence store (WAL mode) for HITL requests and audit events.
  *
  * @param {string} [dbPath] Path to SQLite file, or ':memory:' for deterministic tests
@@ -83,8 +94,8 @@ export function createDatabase(dbPath = config.dbPath) {
       channel TEXT,
       outbound_msg_id TEXT,
       timeout_seconds INTEGER NOT NULL DEFAULT 600,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
 
@@ -100,7 +111,7 @@ export function createDatabase(dbPath = config.dbPath) {
       from_state TEXT,
       to_state TEXT,
       details TEXT,
-      created_at INTEGER NOT NULL
+      created_at TEXT NOT NULL
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_message_id
@@ -109,7 +120,28 @@ export function createDatabase(dbPath = config.dbPath) {
 
     CREATE INDEX IF NOT EXISTS idx_audit_events_request_id
       ON audit_events(request_id, created_at ASC);
+
+    UPDATE approval_requests
+    SET created_at = strftime('%Y-%m-%d %H:%M:%S', created_at / 1000, 'unixepoch', 'localtime'),
+        updated_at = strftime('%Y-%m-%d %H:%M:%S', updated_at / 1000, 'unixepoch', 'localtime')
+    WHERE typeof(created_at) = 'integer';
+
+    UPDATE audit_events
+    SET created_at = strftime('%Y-%m-%d %H:%M:%S', created_at / 1000, 'unixepoch', 'localtime')
+    WHERE typeof(created_at) = 'integer';
   `);
+
+  function checkpointWal() {
+    if (dbPath !== ':memory:') {
+      try {
+        db.pragma('wal_checkpoint(TRUNCATE)');
+      } catch {
+        // Ignore if another connection holds a read lock
+      }
+    }
+  }
+
+  checkpointWal();
 
   const insertRequestStmt = db.prepare(`
     INSERT INTO approval_requests (
@@ -128,7 +160,7 @@ export function createDatabase(dbPath = config.dbPath) {
   const getActiveRequestStmt = db.prepare(`
     SELECT * FROM approval_requests
     WHERE state IN ('NOTIFIED', 'AWAITING_CONFIRMATION')
-    ORDER BY created_at DESC
+    ORDER BY created_at DESC, rowid DESC
     LIMIT 1
   `);
 
@@ -190,7 +222,7 @@ export function createDatabase(dbPath = config.dbPath) {
       from_state: fromState,
       to_state: toState,
       details: detailsStr,
-      created_at: Date.now(),
+      created_at: formatTimestamp(),
     });
   }
 
@@ -214,6 +246,7 @@ export function createDatabase(dbPath = config.dbPath) {
       }
 
       const now = Date.now();
+      const nowFormatted = formatTimestamp(now);
       const expiresAt = now + timeoutSeconds * 1000;
 
       insertRequestStmt.run({
@@ -226,8 +259,8 @@ export function createDatabase(dbPath = config.dbPath) {
         risk_level: riskLevel,
         state: STATES.PENDING,
         timeout_seconds: timeoutSeconds,
-        created_at: now,
-        updated_at: now,
+        created_at: nowFormatted,
+        updated_at: nowFormatted,
         expires_at: expiresAt,
       });
 
@@ -293,7 +326,7 @@ export function createDatabase(dbPath = config.dbPath) {
         throw new Error(`Invalid state transition for ${requestId}: ${fromState} -> ${toState}`);
       }
 
-      const now = Date.now();
+      const nowFormatted = formatTimestamp();
       const result = updateStateStmt.run({
         request_id: requestId,
         from_state: fromState,
@@ -302,7 +335,7 @@ export function createDatabase(dbPath = config.dbPath) {
         human_instructions: humanInstructions,
         channel,
         outbound_msg_id: outboundMsgId,
-        updated_at: now,
+        updated_at: nowFormatted,
       });
 
       if (result.changes !== 1) {
@@ -342,15 +375,30 @@ export function createDatabase(dbPath = config.dbPath) {
 
   return {
     db,
-    createRequest,
-    transitionState,
-    logAudit,
+    createRequest: (params) => {
+      const res = createRequest(params);
+      checkpointWal();
+      return res;
+    },
+    transitionState: (params) => {
+      const res = transitionState(params);
+      checkpointWal();
+      return res;
+    },
+    logAudit: (params) => {
+      const res = logAudit(params);
+      checkpointWal();
+      return res;
+    },
     isMessageProcessed,
     getRequest: (id) => getRequestStmt.get(id),
     getActiveRequest: () => getActiveRequestStmt.get(),
     getAuditEventsForRequest: (id) => getAuditEventsForRequestStmt.all(id),
     getAllAuditEvents: () => getAllAuditEventsStmt.all(),
-    close: () => db.close(),
+    close: () => {
+      checkpointWal();
+      db.close();
+    },
   };
 }
 

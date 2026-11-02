@@ -31,6 +31,11 @@ const envSchema = z.object({
     .trim()
     .optional()
     .transform((v) => Number.parseInt(v || '60000', 10) || 60000),
+  REMINDER_COUNTER: z
+    .string()
+    .trim()
+    .optional()
+    .transform((v) => Math.max(0, Number.parseInt(v || '0', 10) || 0)),
   QUIET_HOURS: z.string().trim().default(''),
   DB_PATH: z.string().trim().default(''),
 });
@@ -47,6 +52,7 @@ export const config = {
   twilioAuthToken: parsed.TWILIO_AUTH_TOKEN,
   twilioFromNumber: parsed.TWILIO_FROM_NUMBER,
   escalationTimeoutMs: parsed.ESCALATION_TIMEOUT_MS,
+  reminderCounter: parsed.REMINDER_COUNTER,
   quietHours: parsed.QUIET_HOURS,
   dbPath: parsed.DB_PATH
     ? path.resolve(PROJECT_ROOT, parsed.DB_PATH)
