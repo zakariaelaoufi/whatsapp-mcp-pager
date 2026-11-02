@@ -2,7 +2,7 @@
 
 A **WhatsApp MCP PAGER Server** for AI coding agents (Antigravity, Cursor, Claude Code, Windsurf).
 
-When your agent needs approval for a risky command, database migration, or deployment—and you're away from your screen—it messages you on **WhatsApp** with a formatted summary, an **Opus voice note**, and a **6-second wake-up call** if you don't reply in time.
+When your agent needs approval for a risky command, database migration, or deployment—and you're away from your screen. it messages you on **WhatsApp** with a formatted summary, an **Opus voice note**, and a **6-second wake-up call** if you don't reply in time.
 
 ---
 
