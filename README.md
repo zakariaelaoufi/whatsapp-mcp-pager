@@ -1,26 +1,26 @@
-# Whatsapp MCP Pager
+# WhatsApp MCP PAGER
 
-**Fail-Closed WhatsApp Human-in-the-Loop (HITL) MCP Server for AI Coding Agents**
+A **WhatsApp MCP PAGER Server** for AI coding agents (Antigravity, Cursor, Claude Code, Windsurf).
 
-Pause your AI coding agent (Cursor, Claude Code, Windsurf, etc.) and request human authorization, modifications, or clarification via **WhatsApp** (structured text + Opus voice notes + a 60-second wake-up flash call).
-
-> **Fail-Closed Principle:** A missing, late, duplicated, ambiguous, or unconfirmed high-risk voice response is **never** interpreted as approval. Every error, timeout, or ambiguity defaults to rejection, expiration, or an explicit confirmation prompt.
+When your agent needs approval for a risky command, database migration, or deployment—and you're away from your screen—it messages you on **WhatsApp** with a formatted summary, an **Opus voice note**, and a **6-second wake-up call** if you don't reply in time.
 
 ---
 
-## Key Features
+## How It Works
 
-- **Formal SQLite State Machine (`better-sqlite3` WAL):** Atomic transitions (`PENDING` → `NOTIFIED` → `AWAITING_CONFIRMATION` → `APPROVED` / `REJECTED` / `MODIFICATION_REQUESTED` / `NEEDS_CLARIFICATION` / `EXPIRED` / `DELIVERY_FAILED`) with strict terminal-state immutability and `audit_events` idempotency.
-- **High-Risk Voice Safeguard:** Voice notes on `HIGH` or `CRITICAL` risk actions never execute immediately—the server echoes the Whisper transcript, transitions to `AWAITING_CONFIRMATION`, and requires an explicit `Y` or `N` text confirmation.
-- **Automatic Secret Redaction:** Strips `.env` secrets, API keys (`sk-...`, `gsk_...`, `ghp_...`), Bearer tokens, and inline passwords from commands/diffs before storing or sending to WhatsApp.
-- **6-Second Wake-Up Ring:** If no reply arrives within 60 seconds (outside optional `QUIET_HOURS`), triggers a 6-second WhatsApp voice call (or Twilio flash call) and hangs up automatically.
-- **15-Second MCP Progress Heartbeats:** Keeps IDE clients alive during long human wait times, plus `wait_for_approval` to resume waiting on an existing `request_id` without duplicate messages.
+1. **On-Screen Countdown (`REMINDER_COUNTER`):** Waits a configurable countdown (e.g. `60s`) before notifying WhatsApp so your phone doesn't buzz while you're already at your computer.
+2. **Text + Voice Note:** Sends the proposed command/diff (with API keys and secrets automatically redacted) plus a spoken summary via OpenAI TTS.
+3. **Reply by Text or Voice:**
+   - Reply `Y` / `N` by text, or send a **voice note** (transcribed via Whisper) to approve, reject, ask for clarification, or request changes.
+   - **High-Risk Safeguard:** Voice approvals on `HIGH` or `CRITICAL` actions require a final `Y` text confirmation before executing.
+4. **Wake-Up Ring:** If you don't respond within `ESCALATION_TIMEOUT_MS` (default `60s`), it rings your phone for 6 seconds to get your attention.
+5. **SQLite Audit Log:** Every request and state transition is logged in `.hitl.sqlite`.
 
 ---
 
 ## Quick Start
 
-### 1. Clone & Install
+### 1. Install
 
 ```bash
 git clone https://github.com/<your-username>/whatsapp-hitl-mcp.git
@@ -28,15 +28,7 @@ cd whatsapp-hitl-mcp
 npm install
 ```
 
-### 2. Run Automated Tests (No WhatsApp Needed)
-
-Verify the state machine, risk rules, secret redaction, idempotency, and expiration timers using `MockProvider`:
-
-```bash
-npm test
-```
-
-### 3. Configure `.env`
+### 2. Configure `.env`
 
 ```bash
 cp .env.example .env
@@ -46,72 +38,77 @@ cp .env.example .env
 # Your WhatsApp number in international format (no '+' or spaces), ending in @c.us
 MY_WHATSAPP_ID=14155552671@c.us
 
-# Required: OpenAI API Key (for Opus TTS voice notes & Whisper STT)
+# OpenAI API Key (for Opus voice notes & Whisper transcription)
 OPENAI_API_KEY=sk-proj-...
 
-# Optional: Groq API Key (uses whisper-large-v3-turbo for faster STT if set)
+# Optional: Groq API Key (faster Whisper transcription if set)
 GROQ_API_KEY=
 
-# "puppeteer" (WhatsApp Web 6s voice call) or "twilio" (cellular 6s flash call)
-WAKEUP_MODE=puppeteer
+# Countdown in seconds before sending a WhatsApp reminder (0 = immediate)
+REMINDER_COUNTER=60
 
-# Escalation timeout before triggering the 6s wake-up ring (default: 60000 = 60s)
+# Time in ms before triggering the 6-second wake-up ring (default: 60000 = 60s)
 ESCALATION_TIMEOUT_MS=60000
 
-# Optional: Quiet hours in HH:MM-HH:MM 24h local format (suppresses wake-up ring, e.g. 23:00-07:00)
+# "puppeteer" (WhatsApp Web call) or "twilio" (cellular flash call)
+WAKEUP_MODE=puppeteer
+
+# Optional: Suppress wake-up calls during sleep hours (24h format, e.g. 23:00-07:00)
 QUIET_HOURS=
 ```
 
-### 4. Link WhatsApp (One-Time QR Scan)
+### 3. Link WhatsApp (One-Time)
 
 ```bash
 npm run login
 ```
 
-Scan the QR code in your terminal from WhatsApp (**Linked Devices → Link a Device**). Session state is saved to `.wwebjs_auth/`.
+Scan the QR code in your terminal using WhatsApp (**Linked Devices → Link a Device**). Your session is saved locally in `.wwebjs_auth/`.
 
-### 5. Test Live WhatsApp Flow
+### 4. Add to Your MCP Client
 
-```bash
-npm run test-pager
-```
-
----
-
-## MCP Configuration
-
-Add to `.cursor/mcp.json` or `claude_desktop_config.json`:
+Add this to your IDE's `mcp_config.json` / `.cursor/mcp.json` / `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "whatsapp-hitl": {
       "command": "node",
-      "args": ["/absolute/path/to/whatsapp-mcp-pager/src/index.js"]
+      "args": ["/absolute/path/to/my-whatsapp-ai-reminder/src/index.js"]
     }
   }
 }
 ```
 
+### 5. Add Agent Rule (Recommended)
+
+Add this rule to your agent's global instructions (`AGENTS.md` / `.cursorrules` / `CLAUDE.md`):
+
+```markdown
+# WhatsApp Human-in-the-Loop Rule
+- Before running any destructive command, database migration, production deployment, or irreversible change, call the `whatsapp-hitl` MCP tool `request_approval` with the appropriate `risk_level` (`LOW`, `MEDIUM`, `HIGH`, or `CRITICAL`).
+- If `final_state` is `MODIFICATION_REQUESTED` or `NEEDS_CLARIFICATION`, follow `human_instructions` and re-request approval before proceeding.
+- If `final_state` is `REJECTED`, `EXPIRED`, or `DELIVERY_FAILED`, stop immediately and do not execute the action.
+- When blocked on an architectural question while the user is away, call `request_human_input`.
+```
+
 ---
 
-## Exposed MCP Tools
+## MCP Tools
 
-### 1. `request_approval`
-Request formal human approval before executing a command, migration, or code change.
-- **Arguments:**
-  - `project` (`string`): Project name (e.g., `"inventory-service"`).
-  - `summary` (`string`): What the agent finished and why approval is needed.
-  - `command_or_diff` (`string`): Command, SQL migration, or diff (secrets are auto-redacted).
-  - `spoken_prompt` (`string`): 1–2 sentence spoken summary for the Opus voice note.
-  - `risk_level` (`"LOW" | "MEDIUM" | "HIGH" | "CRITICAL"`): Risk level.
-  - `timeout_seconds` (`number`, default `600`): Deadline before failing closed as `EXPIRED`.
-- **Returns:** `{ request_id, final_state, decision, human_instructions, channel }`
+| Tool | Description | Key Parameters |
+| :--- | :--- | :--- |
+| `request_approval` | Pause execution and request approval via WhatsApp text + voice note. | `project`, `summary`, `command_or_diff`, `spoken_prompt`, `risk_level`, `timeout_seconds` |
+| `wait_for_approval` | Resume waiting on an existing `request_id` without resending messages. | `request_id` (e.g. `AP-82F4`) |
+| `request_human_input` | Ask an open-ended question on WhatsApp and wait for a text/voice reply. | `project`, `question`, `spoken_prompt` |
 
-### 2. `wait_for_approval`
-Resume waiting on an existing `request_id` without sending duplicate WhatsApp messages if the IDE client timed out early.
-- **Arguments:** `request_id` (`string`, e.g. `"AP-82F4"`)
+---
 
-### 3. `request_human_input`
-Ask an open-ended question via WhatsApp text + voice note and wait for the human's answer.
-- **Arguments:** `project` (`string`), `question` (`string`), `spoken_prompt` (`string`)
+## Testing
+
+```bash
+# Run offline unit tests (state machine, redaction, countdown, timeouts)
+npm test
+
+# Send a live test approval to your WhatsApp
+npm run test-pager
