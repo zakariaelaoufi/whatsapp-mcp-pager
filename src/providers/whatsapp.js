@@ -324,6 +324,7 @@ export class WhatsAppWebProvider extends NotificationProvider {
         let channel = 'text';
 
         if (isVoiceNote && isAllowedSender) {
+          this.emitInboundActivity({ senderId: msg.from, channel: 'voice_note' });
           console.error('[WhatsApp] Voice note reply detected. Downloading & transcribing...');
           const base64Audio = await this._downloadVoiceNoteBase64(msg);
           text = await transcribeVoiceNote(base64Audio);
@@ -519,10 +520,11 @@ export class WhatsAppWebProvider extends NotificationProvider {
     return { outboundMsgId };
   }
 
-  async triggerWakeUp({ requestId }) {
+  async triggerWakeUp({ requestId, signal }) {
     await this.ensureReady();
+    if (signal?.aborted) return;
     console.error(`[WhatsApp] Triggering 6s wake-up ring for [${requestId}]...`);
-    await ringAndInterrupt(this.client, this.targetChatId);
+    await ringAndInterrupt(this.client, this.targetChatId, { signal });
   }
 
   async destroy() {

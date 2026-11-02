@@ -1,7 +1,36 @@
 import twilio from 'twilio';
 import { config } from './config.js';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function abortableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+function isBrowserClosingError(err) {
+  const msg = err?.message || String(err || '');
+  return (
+    msg.includes('detached Frame') ||
+    msg.includes('Target closed') ||
+    msg.includes('Session closed') ||
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('Protocol error')
+  );
+}
 
 /**
  * Triggers a 6-second "Ring-and-Hang-Up" (Flash Call / Bipa) to physically vibrate
@@ -9,8 +38,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *
  * @param {import('whatsapp-web.js').Client} whatsappClient
  * @param {string} chatId
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
  */
-export async function ringAndInterrupt(whatsappClient, chatId) {
+export async function ringAndInterrupt(whatsappClient, chatId, { signal } = {}) {
+  if (signal?.aborted) return;
+
   const mode = (process.env.WAKEUP_MODE || config.wakeupMode || 'puppeteer').toLowerCase();
 
   if (mode === 'twilio') {
@@ -30,18 +63,18 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
         timeout: 6,
       });
 
-      // Double safeguard: force hangup after 6000ms
-      setTimeout(async () => {
-        try {
-          await twilioClient.calls(call.sid).update({ status: 'completed' });
-          console.error(`[WakeUp] Twilio call ${call.sid} hung up after 6s safeguard.`);
-        } catch (hangupErr) {
-          console.error(`[WakeUp] Twilio safeguard hangup note: ${hangupErr.message}`);
-        }
-      }, 6000);
+      await abortableSleep(6000, signal);
+
+      try {
+        await twilioClient.calls(call.sid).update({ status: 'completed' });
+        console.error(`[WakeUp] Twilio call ${call.sid} hung up after 6s safeguard.`);
+      } catch (hangupErr) {
+        console.error(`[WakeUp] Twilio safeguard hangup note: ${hangupErr.message}`);
+      }
 
       return;
     } catch (twilioErr) {
+      if (signal?.aborted) return;
       console.error(
         `[WakeUp] Twilio flash call failed (${twilioErr.message}), falling back to Puppeteer/buzzer...`
       );
@@ -51,11 +84,10 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
   // Default: WAKEUP_MODE === 'puppeteer'
   try {
     const page = whatsappClient?.pupPage;
-    if (!page) {
-      throw new Error('whatsappClient.pupPage is not available');
+    if (!page || page.isClosed?.() || !whatsappClient?.pupBrowser?.isConnected?.()) {
+      return;
     }
 
-    // Ensure microphone/camera permissions are granted so WebRTC voice call starts cleanly
     try {
       const context = whatsappClient.pupBrowser?.defaultBrowserContext?.();
       if (context) {
@@ -66,8 +98,10 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
         ]);
       }
     } catch {
-      // Ignore permission override errors if unsupported
+      // Ignore permission override errors
     }
+
+    if (signal?.aborted) return;
 
     // Dismiss any "Continue" popup modal and open the target chat using WAWebCmd.Cmd.openChatBottom
     await page.evaluate(async (targetChatId) => {
@@ -88,7 +122,6 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
         if (chat) {
           const Cmd = window.require('WAWebCmd')?.Cmd;
           if (Cmd && typeof Cmd.openChatBottom === 'function') {
-            // Do not await openChatBottom directly as its internal UI promise may not settle
             Cmd.openChatBottom({ chat });
           } else if (Cmd && typeof Cmd.openChatAt === 'function') {
             Cmd.openChatAt({ chat });
@@ -100,7 +133,10 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
     }, chatId);
 
     // Wait briefly for #main header to render the Voice call button
-    await sleep(1200);
+    await abortableSleep(1200, signal);
+    if (signal?.aborted || page.isClosed?.() || !whatsappClient?.pupBrowser?.isConnected?.()) {
+      return;
+    }
 
     const callClicked = await page.evaluate(() => {
       const btn =
@@ -123,7 +159,11 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
     }
 
     console.error('[WakeUp] Voice call ringing on WhatsApp Web (6s wake-up ring)...');
-    await sleep(6000);
+    await abortableSleep(6000, signal);
+
+    if (page.isClosed?.() || !whatsappClient?.pupBrowser?.isConnected?.()) {
+      return;
+    }
 
     const hungUp = await page.evaluate(() => {
       const endBtn =
@@ -142,27 +182,38 @@ export async function ringAndInterrupt(whatsappClient, chatId) {
     });
 
     if (hungUp) {
-      console.error('[WakeUp] Hung up WhatsApp Web call after 6s.');
+      console.error('[WakeUp] Hung up WhatsApp Web call.');
     } else {
-      console.error('[WakeUp] 6s elapsed (call already ended or End call button not visible).');
+      console.error('[WakeUp] Wake-up ring finished.');
     }
   } catch (pupErr) {
+    if (signal?.aborted || isBrowserClosingError(pupErr)) {
+      return;
+    }
     console.error(
       `[WakeUp] Puppeteer call click unavailable (${pupErr.message}). Sending 3 rapid buzzer messages...`
     );
-    await sendRapidBuzzerMessages(whatsappClient, chatId);
+    await sendRapidBuzzerMessages(whatsappClient, chatId, signal);
   }
 }
 
-async function sendRapidBuzzerMessages(whatsappClient, chatId) {
+async function sendRapidBuzzerMessages(whatsappClient, chatId, signal) {
   const buzzers = ['🚨 RING!', '🚨 WAKE UP!', '🚨 AGENT BLOCKED!'];
   for (let i = 0; i < buzzers.length; i++) {
+    if (
+      signal?.aborted ||
+      whatsappClient?.pupPage?.isClosed?.() ||
+      !whatsappClient?.pupBrowser?.isConnected?.()
+    ) {
+      return;
+    }
     try {
       await whatsappClient.sendMessage(chatId, buzzers[i], { sendSeen: false });
       if (i < buzzers.length - 1) {
-        await sleep(1500);
+        await abortableSleep(1500, signal);
       }
     } catch (err) {
+      if (isBrowserClosingError(err)) return;
       console.error(`[WakeUp] Failed to send buzzer message "${buzzers[i]}":`, err.message);
     }
   }

@@ -184,8 +184,18 @@ export class ApprovalEngine {
     this.escalationTimeoutMs = escalationTimeoutMs;
     this.quietHours = quietHours;
 
-    /** @type {Map<string, { escalationTimer?: NodeJS.Timeout, expirationTimer?: NodeJS.Timeout, resolvers: Set<(res: object) => void> }>} */
+    /** @type {Map<string, { escalationTimer?: NodeJS.Timeout, expirationTimer?: NodeJS.Timeout, wakeUpAbort?: AbortController, resolvers: Set<(res: object) => void> }>} */
     this.activeTrackers = new Map();
+
+    this._unsubscribeActivity =
+      typeof this.provider.onInboundActivity === 'function'
+        ? this.provider.onInboundActivity(() => {
+            const active = this.store.getActiveRequest();
+            if (active) {
+              this._clearEscalationTimer(active.request_id);
+            }
+          })
+        : null;
 
     this._unsubscribeInbound = this.provider.onInboundMessage((inbound) =>
       this._handleInboundMessage(inbound)
@@ -198,6 +208,7 @@ export class ApprovalEngine {
       tracker = {
         escalationTimer: undefined,
         expirationTimer: undefined,
+        wakeUpAbort: undefined,
         resolvers: new Set(),
       };
       this.activeTrackers.set(requestId, tracker);
@@ -212,6 +223,10 @@ export class ApprovalEngine {
       clearTimeout(tracker.escalationTimer);
       tracker.escalationTimer = undefined;
     }
+    if (tracker.wakeUpAbort) {
+      tracker.wakeUpAbort.abort();
+      tracker.wakeUpAbort = undefined;
+    }
     if (tracker.expirationTimer) {
       clearTimeout(tracker.expirationTimer);
       tracker.expirationTimer = undefined;
@@ -220,9 +235,14 @@ export class ApprovalEngine {
 
   _clearEscalationTimer(requestId) {
     const tracker = this.activeTrackers.get(requestId);
-    if (tracker?.escalationTimer) {
+    if (!tracker) return;
+    if (tracker.escalationTimer) {
       clearTimeout(tracker.escalationTimer);
       tracker.escalationTimer = undefined;
+    }
+    if (tracker.wakeUpAbort) {
+      tracker.wakeUpAbort.abort();
+      tracker.wakeUpAbort = undefined;
     }
   }
 
@@ -266,10 +286,15 @@ export class ApprovalEngine {
             return;
           }
 
+          const wakeUpAbort = new AbortController();
+          tracker.wakeUpAbort = wakeUpAbort;
+
           await this.provider.sendText(
             `🔔 *Still waiting on [${requestId}] — ringing your phone now...*`
           );
-          await this.provider.triggerWakeUp({ requestId });
+          if (wakeUpAbort.signal.aborted) return;
+
+          await this.provider.triggerWakeUp({ requestId, signal: wakeUpAbort.signal });
 
           this.store.logAudit({
             requestId,
@@ -788,6 +813,10 @@ export class ApprovalEngine {
   }
 
   async destroy() {
+    if (this._unsubscribeActivity) {
+      this._unsubscribeActivity();
+      this._unsubscribeActivity = null;
+    }
     if (this._unsubscribeInbound) {
       this._unsubscribeInbound();
       this._unsubscribeInbound = null;

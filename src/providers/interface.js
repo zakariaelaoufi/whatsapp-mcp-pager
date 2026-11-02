@@ -1,21 +1,10 @@
 /**
  * Base contract for HITL Notification Providers (`WhatsAppWebProvider` and `MockProvider`).
- *
- * Inbound message event payload shape passed to `onInboundMessage(callback)`:
- * {
- *   messageId: string,           // Unique serialized message ID (e.g., msg.id._serialized)
- *   senderId: string,            // Sender JID / phone ID
- *   isAllowedSender: boolean,    // True if sender matches allowlisted MY_WHATSAPP_ID / LID
- *   channel: 'text' | 'voice_note',
- *   text: string,                // Raw text body or Whisper-transcribed voice note text
- *   quotedRequestId?: string,    // Optional AP-XXXX extracted if the user swipe-replied to an earlier prompt
- *   quotedMessageId?: string,    // Optional serialized ID of quoted message
- *   timestampMs: number
- * }
  */
 export class NotificationProvider {
   constructor() {
     this._inboundListeners = new Set();
+    this._activityListeners = new Set();
   }
 
   /**
@@ -51,10 +40,36 @@ export class NotificationProvider {
    * Triggers the 6-second wake-up ring (flash call / WhatsApp Web voice call).
    * @param {object} _params
    * @param {string} _params.requestId
+   * @param {AbortSignal} [_params.signal]
    * @returns {Promise<void>}
    */
   async triggerWakeUp(_params) {
     throw new Error('NotificationProvider.triggerWakeUp() must be implemented by subclass');
+  }
+
+  /**
+   * Registers an inbound activity listener (fired immediately when a voice note starts
+   * downloading/transcribing so escalation timers are canceled right away).
+   * @param {(info: object) => void} listener
+   * @returns {() => void}
+   */
+  onInboundActivity(listener) {
+    this._activityListeners.add(listener);
+    return () => this._activityListeners.delete(listener);
+  }
+
+  /**
+   * Emits an inbound activity signal (e.g. voice note download/transcription started).
+   * @param {object} info
+   */
+  emitInboundActivity(info = {}) {
+    for (const listener of Array.from(this._activityListeners)) {
+      try {
+        listener(info);
+      } catch {
+        // Ignore activity listener errors
+      }
+    }
   }
 
   /**
@@ -83,4 +98,3 @@ export class NotificationProvider {
    */
   async destroy() {}
 }
-

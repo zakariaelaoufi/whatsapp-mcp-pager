@@ -1,4 +1,4 @@
-# whatsapp-hitl-mcp
+# Whatsapp MCP Pager
 
 **Fail-Closed WhatsApp Human-in-the-Loop (HITL) MCP Server for AI Coding Agents**
 
@@ -87,7 +87,7 @@ Add to `.cursor/mcp.json` or `claude_desktop_config.json`:
   "mcpServers": {
     "whatsapp-hitl": {
       "command": "node",
-      "args": ["/absolute/path/to/whatsapp-hitl-mcp/src/index.js"]
+      "args": ["/absolute/path/to/whatsapp-mcp-pager/src/index.js"]
     }
   }
 }
@@ -115,9 +115,3 @@ Resume waiting on an existing `request_id` without sending duplicate WhatsApp me
 ### 3. `request_human_input`
 Ask an open-ended question via WhatsApp text + voice note and wait for the human's answer.
 - **Arguments:** `project` (`string`), `question` (`string`), `spoken_prompt` (`string`)
-
----
-
-## License
-
-MIT
