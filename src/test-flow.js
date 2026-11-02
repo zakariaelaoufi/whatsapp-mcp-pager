@@ -1,34 +1,41 @@
-import { askHumanWithWakeUpCall, getWhatsAppClient } from './whatsapp.js';
+import { config } from './config.js';
+import { createDatabase } from './db.js';
+import { ApprovalEngine } from './engine.js';
+import { WhatsAppWebProvider } from './providers/whatsapp.js';
 
-async function runTestFlow() {
-  console.error('🚀 Starting standalone WhatsApp Walkie-Talkie + Wake-Up Ring test...');
-  console.error('⏳ Waiting for WhatsApp session to become ready...');
+async function runLiveFlow() {
+  console.error('🚀 Starting live WhatsApp Fail-Closed HITL approval test...');
+
+  const store = createDatabase(config.dbPath);
+  const provider = new WhatsAppWebProvider();
+  const engine = new ApprovalEngine({
+    store,
+    provider,
+    escalationTimeoutMs: config.escalationTimeoutMs,
+    quietHours: config.quietHours,
+  });
 
   try {
-    const result = await askHumanWithWakeUpCall({
-      summary:
-        'Finished generating the database migration for dropping legacy user tables. Need human confirmation before applying changes to production.',
-      commandOrDiff: 'npx prisma migrate deploy --preview-feature\n# Drops table: legacy_sessions',
+    const result = await engine.requestApproval({
+      project: 'inventory-service',
+      summary: 'Apply production schema migration (drops legacy_sessions table)',
+      commandOrDiff: 'npx prisma migrate deploy',
       spokenPrompt:
-        'Hey! I finished the database schema migration. It drops the legacy sessions table. Should I run the migration now, or hold off?',
+        'Hey! I am ready to apply the production schema migration on inventory service. Reply Y to approve, N to reject, or send a voice note.',
+      riskLevel: 'HIGH',
+      timeoutSeconds: 600,
     });
 
-    console.error('\n✅ Human Response Received!');
-    console.error(`📡 Channel: ${result.channel}`);
-    console.error(`💬 Instructions: ${result.human_response}\n`);
+    console.error('\n✅ Terminal Decision Reached!');
+    console.error(JSON.stringify(result, null, 2));
   } catch (err) {
-    console.error('\n❌ Test flow failed:', err.message);
+    console.error('\n❌ Live test flow failed:', err.message);
     process.exitCode = 1;
   } finally {
-    try {
-      const client = getWhatsAppClient();
-      await client.destroy();
-    } catch {
-      // Ignore cleanup errors
-    }
+    await engine.destroy();
+    store.close();
     process.exit();
   }
 }
 
-runTestFlow();
-
+runLiveFlow();
