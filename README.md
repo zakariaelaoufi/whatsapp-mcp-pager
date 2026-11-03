@@ -26,8 +26,8 @@ You need **two WhatsApp accounts (two phone numbers)**:
 
 You also need:
 - **Node.js 20+**
-- **OpenAI API Key** (for voice notes and Whisper transcription)
-- **Groq API Key** *(optional, for faster Whisper transcription)*
+- **OpenAI API Key** *(optional — enables spoken Opus voice notes and Whisper STT; without it, the pager runs in text-only mode)*
+- **Groq API Key** *(optional — enables ultra-fast Whisper voice-note transcription)*
 
 ---
 
@@ -62,8 +62,8 @@ Edit `.env` with your details:
 # Your personal WhatsApp number (international format, no '+' or spaces, ending in @c.us)
 MY_WHATSAPP_ID=14155552671@c.us
 
-# Required: OpenAI API Key (for Opus voice notes & Whisper STT)
-OPENAI_API_KEY=sk-proj-...
+# Optional: OpenAI API Key (for Opus voice notes & Whisper STT; omit for text-only mode)
+OPENAI_API_KEY=
 
 # Optional: Groq API Key (for faster STT transcription)
 GROQ_API_KEY=

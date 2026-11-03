@@ -3,7 +3,8 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { isWithinQuietHours, PROJECT_ROOT, validateConfig } from './config.js';
+import { generateOpusVoiceNote, transcribeVoiceNote } from './audio.js';
+import { config, hasOpenAIKey, hasSTTKey, isWithinQuietHours, PROJECT_ROOT, validateConfig } from './config.js';
 import { createDatabase, migrateApprovalRequestsSchema, STATES } from './db.js';
 import { ApprovalEngine, parseReply, classifyDecision } from './engine.js';
 import { computeEffectiveRisk } from './policy.js';
@@ -601,17 +602,46 @@ async function runTests() {
     assert.equal(isWithinQuietHours(at1400, '13:00-15:00'), true, '14:00 is within 13:00-15:00');
     assert.equal(isWithinQuietHours(at1400, ''), false, 'Empty quietHours returns false');
 
-    // 12b. validateConfig rejects placeholder values
+    // 12b. validateConfig rejects placeholder values and allows missing OPENAI_API_KEY by default
     const origWaId = process.env.MY_WHATSAPP_ID;
+    const origOpenAi = process.env.OPENAI_API_KEY;
+    const origGroq = process.env.GROQ_API_KEY;
+    const origConfigOpenAi = config.openaiApiKey;
+    const origConfigGroq = config.groqApiKey;
     try {
       process.env.MY_WHATSAPP_ID = '1XXXXXXXXXX@c.us';
       assert.throws(
-        () => validateConfig({ requireOpenAI: false, silent: true }),
+        () => validateConfig({ silent: true }),
         /MY_WHATSAPP_ID still contains placeholder/
+      );
+
+      // Valid MY_WHATSAPP_ID without OPENAI_API_KEY succeeds and disables voice notes gracefully
+      process.env.MY_WHATSAPP_ID = '14155552671@c.us';
+      process.env.OPENAI_API_KEY = '';
+      process.env.GROQ_API_KEY = '';
+      config.openaiApiKey = '';
+      config.groqApiKey = '';
+
+      assert.doesNotThrow(() => validateConfig({ silent: true }));
+      assert.equal(hasOpenAIKey(), false, 'hasOpenAIKey() must be false when OPENAI_API_KEY is unset');
+      assert.equal(hasSTTKey(), false, 'hasSTTKey() must be false when both keys are unset');
+
+      const pttMedia = await generateOpusVoiceNote('Hello test');
+      assert.equal(pttMedia, null, 'generateOpusVoiceNote must return null when OPENAI_API_KEY is unset');
+
+      await assert.rejects(
+        () => transcribeVoiceNote('dGVzdA=='),
+        /No OPENAI_API_KEY or GROQ_API_KEY configured/
       );
     } finally {
       if (origWaId === undefined) delete process.env.MY_WHATSAPP_ID;
       else process.env.MY_WHATSAPP_ID = origWaId;
+      if (origOpenAi === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = origOpenAi;
+      if (origGroq === undefined) delete process.env.GROQ_API_KEY;
+      else process.env.GROQ_API_KEY = origGroq;
+      config.openaiApiKey = origConfigOpenAi;
+      config.groqApiKey = origConfigGroq;
     }
 
     // 12c. Pre-dispatch countdownMs delays prompt dispatch and respects pre-send cancellation
