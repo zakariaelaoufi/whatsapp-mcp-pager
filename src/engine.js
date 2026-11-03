@@ -1,5 +1,7 @@
-import { config, isWithinQuietHours, redactSecrets } from './config.js';
+import { config, isWithinQuietHours, STALE_REPLY_COOLDOWN_MS } from './config.js';
 import { ACTIVE_WAITING_STATES, STATES, TERMINAL_STATES } from './db.js';
+import { evaluateRiskPolicy } from './policy.js';
+import { redactSecrets } from './redact.js';
 
 const AFFIRMATIVE_PATTERNS = new Set([
   'y',
@@ -64,8 +66,11 @@ export function classifyDecision(rawText) {
     return 'REJECT';
   }
 
-  // Normalize punctuation for exact/clear intent matching
-  const normalized = trimmed
+  // Strip an explicit AP-XXXX prefix/suffix when checking affirmative/negative intent
+  const withoutId = trimmed.replace(/\[?AP-[A-F0-9]{4}\]?/gi, '').trim();
+  const targetForIntent = withoutId || trimmed;
+
+  const normalized = targetForIntent
     .toLowerCase()
     .replace(/['’]/g, '')
     .replace(/[,!.]+/g, ' ')
@@ -82,8 +87,8 @@ export function classifyDecision(rawText) {
 
   if (
     trimmed.endsWith('?') ||
-    /^(what|why|how|where|when|which|who|can you explain|is this|does this|will this)\b/i.test(
-      trimmed
+    /^(what|why|how|where|when|which|who|can you explain|can you clarify|is this|does this|will this)\b/i.test(
+      targetForIntent
     )
   ) {
     return 'NEEDS_CLARIFICATION';
@@ -152,12 +157,16 @@ export function formatHumanInputMessage({ requestId, project, timeoutSeconds, qu
 /**
  * Converts a database request row into the canonical MCP response payload.
  */
-function toResultPayload(req) {
+export function toResultPayload(req) {
+  if (!req) return null;
   return {
     request_id: req.request_id,
+    internal_id: req.internal_id,
+    risk_level: req.risk_level,
     final_state: req.state,
     decision: req.decision || req.state,
     human_instructions: req.human_instructions || '',
+    pending_transcript: req.pending_transcript || null,
     channel: req.channel || 'none',
   };
 }
@@ -171,27 +180,30 @@ export class ApprovalEngine {
    * @param {ReturnType<import('./db.js').createDatabase>} options.store
    * @param {import('./providers/interface.js').NotificationProvider} options.provider
    * @param {number} [options.escalationTimeoutMs]
+   * @param {number} [options.staleReplyCooldownMs]
    * @param {string} [options.quietHours]
-   * @param {number} [options.reminderCounter]
-   * @param {number} [options.countdownTickMs]
+   * @param {boolean} [options.reconcileOnInit]
    */
   constructor({
     store,
     provider,
     escalationTimeoutMs = config.escalationTimeoutMs,
+    staleReplyCooldownMs = config.staleReplyCooldownMs ?? STALE_REPLY_COOLDOWN_MS,
     quietHours = config.quietHours,
-    reminderCounter = config.reminderCounter,
-    countdownTickMs = 1000,
+    reconcileOnInit = false,
   }) {
     this.store = store;
     this.provider = provider;
     this.escalationTimeoutMs = escalationTimeoutMs;
+    this.staleReplyCooldownMs = staleReplyCooldownMs;
     this.quietHours = quietHours;
-    this.reminderCounter = Math.max(0, Number(reminderCounter) || 0);
-    this.countdownTickMs = Math.max(1, Number(countdownTickMs) || 1000);
 
     /** @type {Map<string, { escalationTimer?: NodeJS.Timeout, expirationTimer?: NodeJS.Timeout, wakeUpAbort?: AbortController, resolvers: Set<(res: object) => void> }>} */
     this.activeTrackers = new Map();
+
+    if (reconcileOnInit) {
+      this.reconcileOnStartup();
+    }
 
     this._unsubscribeActivity =
       typeof this.provider.onInboundActivity === 'function'
@@ -206,6 +218,18 @@ export class ApprovalEngine {
     this._unsubscribeInbound = this.provider.onInboundMessage((inbound) =>
       this._handleInboundMessage(inbound)
     );
+  }
+
+  /**
+   * Section 5.1: Marks all orphaned PENDING, NOTIFIED, or AWAITING_CONFIRMATION requests
+   * as EXPIRED with audit reason "EXPIRED_ON_SERVER_RESTART".
+   */
+  reconcileOnStartup(now = Date.now()) {
+    const reconciled = this.store.reconcileOnStartup(now);
+    for (const req of reconciled) {
+      this._resolveWaiters(req.request_id, req);
+    }
+    return reconciled;
   }
 
   _getOrCreateTracker(requestId) {
@@ -310,11 +334,10 @@ export class ApprovalEngine {
             details: { escalationTimeoutMs: this.escalationTimeoutMs },
           });
         } catch (err) {
-          // Section 4.3: A failure in the wake-up call must never crash or alter the state machine
           this.store.logAudit({
             requestId,
             eventType: 'WAKEUP_RING_ERROR',
-            details: { error: err?.message || String(err) },
+            details: { error: redactSecrets(err?.message || String(err)) },
           });
         }
       }, this.escalationTimeoutMs);
@@ -346,111 +369,110 @@ export class ApprovalEngine {
   }
 
   /**
-   * Runs the per-request countdown (`REMINDER_COUNTER` down to `0`) before dispatching a WhatsApp notification.
-   * If the request is aborted or resolved on screen before the counter hits `0`, no WhatsApp notification is sent.
-   *
-   * @param {string} requestId
-   * @param {object} [options]
-   * @param {AbortSignal} [options.signal]
-   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number, remainingCountdown?: number }) => void} [options.onHeartbeat]
-   * @returns {Promise<{ shouldNotify: boolean, request?: object }>}
+   * Sweeps any expired requests and resolves their in-memory waiters before checking for active locks.
    */
-  async _waitForRequestCountdown(requestId, { signal, onHeartbeat } = {}) {
-    if (this.reminderCounter <= 0) {
-      return { shouldNotify: true };
+  _sweepAndCheckActiveLock() {
+    const newlyExpired = this.store.sweepExpiredRequests(Date.now());
+    for (const expReq of newlyExpired) {
+      this._resolveWaiters(expReq.request_id, expReq);
     }
 
-    let remaining = this.reminderCounter;
-    let elapsedTicks = 0;
-
-    while (remaining > 0) {
-      if (signal?.aborted) {
-        const current = this.store.getRequest(requestId);
-        if (current && !TERMINAL_STATES.has(current.state)) {
-          const { request: abortedReq } = this.store.transitionState({
-            requestId,
-            toState: STATES.REJECTED,
-            decision: STATES.REJECTED,
-            humanInstructions: `Cancelled on screen before countdown reached 0 (${remaining}/${this.reminderCounter} remaining).`,
-            channel: 'screen',
-            eventType: 'COUNTDOWN_CANCELLED_BEFORE_ZERO',
-          });
-          return { shouldNotify: false, request: abortedReq };
-        }
-        return { shouldNotify: false, request: current };
-      }
-
-      const current = this.store.getRequest(requestId);
-      if (!current || TERMINAL_STATES.has(current.state)) {
-        return { shouldNotify: false, request: current };
-      }
-
-      await new Promise((resolve) => {
-        const onAbort = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(() => {
-          signal?.removeEventListener('abort', onAbort);
-          resolve();
-        }, this.countdownTickMs);
-        signal?.addEventListener('abort', onAbort, { once: true });
+    const active = this.store.getBlockingActiveRequest(Date.now());
+    if (active) {
+      this.store.logAudit({
+        requestId: active.request_id,
+        eventType: 'BUSY_ACTIVE_REQUEST_REJECTED',
+        fromState: active.state,
+        toState: active.state,
+        details: { activeRequestId: active.request_id, state: active.state },
       });
 
-      if (signal?.aborted) {
-        continue;
-      }
-
-      remaining -= 1;
-      elapsedTicks += 1;
-
-      console.error(
-        `[Countdown] [${requestId}] Counter=${remaining}/${this.reminderCounter} before sending WhatsApp reminder...`
-      );
-
-      if (typeof onHeartbeat === 'function') {
-        try {
-          onHeartbeat({
-            requestId,
-            state: STATES.PENDING,
-            elapsedSeconds: elapsedTicks,
-            remainingCountdown: remaining,
-          });
-        } catch {
-          // Ignore heartbeat callback errors
-        }
-      }
+      return {
+        error: 'BUSY_ACTIVE_REQUEST',
+        code: 'BUSY_ACTIVE_REQUEST',
+        request_id: active.request_id,
+        active_request_id: active.request_id,
+        final_state: 'BUSY_ACTIVE_REQUEST',
+        decision: 'BUSY_ACTIVE_REQUEST',
+        human_instructions: `Another request [${active.request_id}] is currently active (${active.state}). Wait for it via wait_for_approval or cancel it via cancel_approval first.`,
+        channel: 'none',
+      };
     }
 
-    const afterCountdown = this.store.getRequest(requestId);
-    if (!afterCountdown || TERMINAL_STATES.has(afterCountdown.state)) {
-      return { shouldNotify: false, request: afterCountdown };
+    return null;
+  }
+
+  /**
+   * Section 5.2: Centralized Cancellation Path (`cancelRequest(requestId, reason)`).
+   * Clears timers, transitions to CANCELLED (if non-terminal), and sends a best-effort
+   * WhatsApp notification if the user was already notified.
+   */
+  async cancelRequest(requestId, reason = 'Cancelled by caller') {
+    const id = String(requestId || '').toUpperCase();
+    const current = this.store.getRequest(id);
+    if (!current) {
+      throw new Error(`Approval request "${id}" not found.`);
     }
 
-    this.store.logAudit({
-      requestId,
-      eventType: 'COUNTDOWN_REACHED_ZERO',
-      fromState: STATES.PENDING,
-      toState: STATES.PENDING,
-      details: { reminderCounter: this.reminderCounter },
+    this._clearTimers(id);
+
+    // Never overwrite a request that is already in a terminal state
+    if (TERMINAL_STATES.has(current.state)) {
+      return toResultPayload(current);
+    }
+
+    const wasNotified = ACTIVE_WAITING_STATES.has(current.state);
+    const safeReason = redactSecrets(reason);
+
+    const { transitioned, request: cancelledReq } = this.store.transitionState({
+      requestId: id,
+      toState: STATES.CANCELLED,
+      decision: STATES.CANCELLED,
+      humanInstructions: safeReason,
+      eventType: 'REQUEST_CANCELLED',
+      details: { reason: safeReason, previousState: current.state },
     });
 
-    return { shouldNotify: true };
+    if (transitioned && cancelledReq) {
+      this._resolveWaiters(id, cancelledReq);
+
+      if (wasNotified) {
+        try {
+          await this.provider.sendText(
+            `🚫 Request [${id}] was cancelled (${safeReason}). No reply needed.`
+          );
+        } catch (notifyErr) {
+          console.error(
+            `[Engine] Best-effort cancellation notice failed for [${id}]:`,
+            notifyErr.message
+          );
+        }
+      }
+
+      return toResultPayload(cancelledReq);
+    }
+
+    return toResultPayload(this.store.getRequest(id));
+  }
+
+  /**
+   * Returns the current persisted state of `requestId` (running an expiration sweep first).
+   */
+  getApprovalStatus(requestId) {
+    const newlyExpired = this.store.sweepExpiredRequests(Date.now());
+    for (const expReq of newlyExpired) {
+      this._resolveWaiters(expReq.request_id, expReq);
+    }
+
+    const req = this.store.getRequest(requestId);
+    if (!req) {
+      throw new Error(`Approval request "${requestId}" not found.`);
+    }
+    return toResultPayload(req);
   }
 
   /**
    * Creates, dispatches, and waits for a formal approval request.
-   *
-   * @param {object} params
-   * @param {string} params.project
-   * @param {string} params.summary
-   * @param {string} params.commandOrDiff
-   * @param {string} params.spokenPrompt
-   * @param {'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'} [params.riskLevel]
-   * @param {number} [params.timeoutSeconds]
-   * @param {AbortSignal} [params.signal]
-   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number, remainingCountdown?: number }) => void} [params.onHeartbeat]
-   * @returns {Promise<{ request_id: string, final_state: string, decision: string, human_instructions: string, channel: string }>}
    */
   async requestApproval({
     project,
@@ -459,30 +481,57 @@ export class ApprovalEngine {
     spokenPrompt,
     riskLevel = 'HIGH',
     timeoutSeconds = 600,
-    signal,
+    mcpWaitTimeoutMs = undefined,
+    signal = undefined,
     onHeartbeat,
   }) {
-    const redactedCommandOrDiff = redactSecrets(commandOrDiff);
-    const redactedSummary = redactSecrets(summary);
+    // 1. One-Active-Request Policy Lock
+    const busyLock = this._sweepAndCheckActiveLock();
+    if (busyLock) {
+      return busyLock;
+    }
 
-    // 1. Persist in SQLite in PENDING state before any outbound network call
+    // 2. Server-Side Risk Escalation Policy (`MAX(agentRiskLevel, serverDerivedRisk)`)
+    const { effectiveRiskLevel, derivedRiskLevel, escalated } = evaluateRiskPolicy({
+      agentRiskLevel: riskLevel,
+      commandOrDiff,
+      summary,
+    });
+
+    // 3. End-to-End Secret Redaction across all fields (including spokenPrompt before TTS!)
+    const redactedProject = redactSecrets(project);
+    const redactedSummary = redactSecrets(summary);
+    const redactedCommandOrDiff = redactSecrets(commandOrDiff);
+    const redactedSpokenPrompt = redactSecrets(spokenPrompt);
+
+    // 4. Persist in SQLite in PENDING state
     const req = this.store.createRequest({
       kind: 'APPROVAL',
-      project,
+      project: redactedProject,
       summary: redactedSummary,
       commandOrDiff: redactedCommandOrDiff,
-      spokenPrompt,
-      riskLevel,
+      spokenPrompt: redactedSpokenPrompt,
+      agentRiskLevel: String(riskLevel || 'HIGH').toUpperCase(),
+      riskLevel: effectiveRiskLevel,
       timeoutSeconds,
     });
 
-    // 1b. Per-request countdown: decrement from REMINDER_COUNTER down to 0 before sending WhatsApp reminder
-    const countdownResult = await this._waitForRequestCountdown(req.request_id, {
-      signal,
-      onHeartbeat,
-    });
-    if (!countdownResult.shouldNotify) {
-      return toResultPayload(countdownResult.request || this.store.getRequest(req.request_id));
+    if (escalated) {
+      this.store.logAudit({
+        requestId: req.request_id,
+        eventType: 'RISK_ESCALATED_BY_POLICY',
+        fromState: STATES.PENDING,
+        toState: STATES.PENDING,
+        details: {
+          agentRequestedRisk: riskLevel,
+          derivedRiskLevel,
+          effectiveRiskLevel,
+        },
+      });
+    }
+
+    if (signal?.aborted) {
+      return this.cancelRequest(req.request_id, 'MCP request aborted before dispatch');
     }
 
     const formattedText = formatApprovalMessage({
@@ -494,7 +543,7 @@ export class ApprovalEngine {
       commandOrDiff: req.command_or_diff,
     });
 
-    // 2. Dispatch via NotificationProvider
+    // 5. Dispatch via NotificationProvider
     try {
       const { outboundMsgId } = await this.provider.sendPrompt({
         requestId: req.request_id,
@@ -511,44 +560,52 @@ export class ApprovalEngine {
 
       this._scheduleTimers(notifiedReq);
     } catch (deliveryErr) {
+      const safeErrMsg = redactSecrets(deliveryErr?.message || String(deliveryErr));
       const { request: failedReq } = this.store.transitionState({
         requestId: req.request_id,
         toState: STATES.DELIVERY_FAILED,
         decision: STATES.DELIVERY_FAILED,
-        humanInstructions: `Delivery failed (Fail-Closed): ${deliveryErr.message}`,
+        humanInstructions: `Delivery failed (Fail-Closed): ${safeErrMsg}`,
         eventType: 'DELIVERY_FAILED',
-        details: { error: deliveryErr.message },
+        details: { error: safeErrMsg },
       });
 
       return toResultPayload(failedReq);
     }
 
-    // 3. Wait for terminal state with optional 15s progress heartbeats
-    return this.waitForApproval(req.request_id, { onHeartbeat });
+    // 6. Wait for terminal state with 15s progress heartbeats and AbortSignal support
+    return this.waitForApproval(req.request_id, {
+      onHeartbeat,
+      mcpWaitTimeoutMs,
+      signal,
+    });
   }
 
   /**
    * Resumes waiting on an existing `request_id` without sending duplicate messages.
-   *
-   * @param {string} requestId
-   * @param {object} [options]
-   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number }) => void} [options.onHeartbeat]
-   * @param {number} [options.heartbeatIntervalMs]
    */
-  async waitForApproval(requestId, { onHeartbeat, heartbeatIntervalMs = 15000 } = {}) {
-    const current = this.store.getRequest(requestId);
+  async waitForApproval(
+    requestId,
+    { onHeartbeat, heartbeatIntervalMs = 15000, mcpWaitTimeoutMs = undefined, signal = undefined } = {}
+  ) {
+    const id = String(requestId || '').toUpperCase();
+    const current = this.store.getRequest(id);
     if (!current) {
-      throw new Error(`Approval request "${requestId}" not found.`);
+      throw new Error(`Approval request "${id}" not found.`);
     }
 
     if (TERMINAL_STATES.has(current.state)) {
       return toResultPayload(current);
     }
 
+    if (signal?.aborted) {
+      return this.cancelRequest(id, 'MCP request aborted by client');
+    }
+
     // Check if already past expiration timestamp
     if (Date.now() >= current.expires_at) {
       const { request: expiredReq } = this.store.transitionState({
-        requestId,
+        requestId: id,
         toState: STATES.EXPIRED,
         decision: STATES.EXPIRED,
         humanInstructions: 'Request timed out without human decision (Fail-Closed).',
@@ -557,8 +614,7 @@ export class ApprovalEngine {
       return toResultPayload(expiredReq);
     }
 
-    // Ensure timers are active if resuming after a reload
-    if (!this.activeTrackers.has(requestId)) {
+    if (!this.activeTrackers.has(id)) {
       this._scheduleTimers(current);
     }
 
@@ -566,68 +622,103 @@ export class ApprovalEngine {
     let heartbeatTimer;
     if (typeof onHeartbeat === 'function' && heartbeatIntervalMs > 0) {
       heartbeatTimer = setInterval(() => {
-        const latest = this.store.getRequest(requestId);
+        const latest = this.store.getRequest(id);
         if (!latest || TERMINAL_STATES.has(latest.state)) {
           clearInterval(heartbeatTimer);
           return;
         }
         const elapsedSeconds = Math.floor((Date.now() - startMs) / 1000);
         try {
-          onHeartbeat({ requestId, state: latest.state, elapsedSeconds });
+          onHeartbeat({ requestId: id, state: latest.state, elapsedSeconds });
         } catch {
           // Ignore heartbeat callback errors
         }
       }, heartbeatIntervalMs);
     }
 
+    let onAbort;
+    let waitWindowTimer;
+
     try {
       return await new Promise((resolve) => {
-        const tracker = this._getOrCreateTracker(requestId);
-        tracker.resolvers.add(resolve);
+        const tracker = this._getOrCreateTracker(id);
+
+        const wrappedResolve = (res) => {
+          tracker.resolvers.delete(wrappedResolve);
+          resolve(res);
+        };
+        tracker.resolvers.add(wrappedResolve);
+
+        if (signal) {
+          onAbort = () => {
+            tracker.resolvers.delete(wrappedResolve);
+            this.cancelRequest(id, 'MCP request aborted by client')
+              .then(resolve)
+              .catch(() => resolve(toResultPayload(this.store.getRequest(id))));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+
+        if (typeof mcpWaitTimeoutMs === 'number' && mcpWaitTimeoutMs > 0) {
+          waitWindowTimer = setTimeout(() => {
+            tracker.resolvers.delete(wrappedResolve);
+            const latest = this.store.getRequest(id);
+            if (latest && !TERMINAL_STATES.has(latest.state)) {
+              resolve({
+                status: 'WAITING',
+                request_id: id,
+                final_state: latest.state,
+                decision: 'WAITING',
+                human_instructions: `Still waiting for human response on [${id}]. Call wait_for_approval to continue waiting.`,
+                channel: 'none',
+              });
+            }
+          }, mcpWaitTimeoutMs);
+        }
       });
     } finally {
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (waitWindowTimer) clearTimeout(waitWindowTimer);
+      if (signal && onAbort) {
+        signal.removeEventListener('abort', onAbort);
       }
     }
   }
 
   /**
    * Asks an open-ended question via text + voice note and waits for the human's response.
-   *
-   * @param {object} params
-   * @param {string} params.project
-   * @param {string} params.question
-   * @param {string} params.spokenPrompt
-   * @param {number} [params.timeoutSeconds]
-   * @param {(progressInfo: { requestId: string, state: string, elapsedSeconds: number }) => void} [params.onHeartbeat]
    */
   async requestHumanInput({
     project,
     question,
     spokenPrompt,
     timeoutSeconds = 600,
-    signal,
+    mcpWaitTimeoutMs = undefined,
+    signal = undefined,
     onHeartbeat,
   }) {
+    const busyLock = this._sweepAndCheckActiveLock();
+    if (busyLock) {
+      return busyLock;
+    }
+
+    const redactedProject = redactSecrets(project);
     const redactedQuestion = redactSecrets(question);
+    const redactedSpokenPrompt = redactSecrets(spokenPrompt);
 
     const req = this.store.createRequest({
       kind: 'HUMAN_INPUT',
-      project,
+      project: redactedProject,
       summary: redactedQuestion,
       commandOrDiff: '',
-      spokenPrompt,
+      spokenPrompt: redactedSpokenPrompt,
+      agentRiskLevel: 'LOW',
       riskLevel: 'LOW',
       timeoutSeconds,
     });
 
-    const countdownResult = await this._waitForRequestCountdown(req.request_id, {
-      signal,
-      onHeartbeat,
-    });
-    if (!countdownResult.shouldNotify) {
-      return toResultPayload(countdownResult.request || this.store.getRequest(req.request_id));
+    if (signal?.aborted) {
+      return this.cancelRequest(req.request_id, 'MCP request aborted before dispatch');
     }
 
     const formattedText = formatHumanInputMessage({
@@ -653,23 +744,28 @@ export class ApprovalEngine {
 
       this._scheduleTimers(notifiedReq);
     } catch (deliveryErr) {
+      const safeErrMsg = redactSecrets(deliveryErr?.message || String(deliveryErr));
       const { request: failedReq } = this.store.transitionState({
         requestId: req.request_id,
         toState: STATES.DELIVERY_FAILED,
         decision: STATES.DELIVERY_FAILED,
-        humanInstructions: `Delivery failed (Fail-Closed): ${deliveryErr.message}`,
+        humanInstructions: `Delivery failed (Fail-Closed): ${safeErrMsg}`,
         eventType: 'DELIVERY_FAILED',
-        details: { error: deliveryErr.message },
+        details: { error: safeErrMsg },
       });
 
       return toResultPayload(failedReq);
     }
 
-    return this.waitForApproval(req.request_id, { onHeartbeat });
+    return this.waitForApproval(req.request_id, {
+      onHeartbeat,
+      mcpWaitTimeoutMs,
+      signal,
+    });
   }
 
   /**
-   * Processes an inbound message from the NotificationProvider according to Section 4.2.
+   * Processes an inbound message from the NotificationProvider according to Sections 2.2, 3.3, and 4.
    */
   async _handleInboundMessage(inbound) {
     const {
@@ -682,12 +778,15 @@ export class ApprovalEngine {
       quotedMessageId,
     } = inbound;
 
+    const now = Date.now();
+
     // 1. Idempotency check: has this message_id already been processed?
     if (messageId && this.store.isMessageProcessed(messageId)) {
       this.store.logAudit({
         eventType: 'DUPLICATE_MESSAGE_IGNORED',
         senderId,
         details: { duplicateMessageId: messageId },
+        now,
       });
       return;
     }
@@ -699,64 +798,53 @@ export class ApprovalEngine {
         messageId,
         senderId,
         details: { text: text.slice(0, 200), channel },
+        now,
       });
       return;
     }
 
-    // 3. Find active request in NOTIFIED or AWAITING_CONFIRMATION
+    // 3. Sweep any expired active requests first
+    const newlyExpired = this.store.sweepExpiredRequests(now);
+    for (const expReq of newlyExpired) {
+      this._resolveWaiters(expReq.request_id, expReq);
+    }
+
+    // Extract explicit AP-XXXX from message body or quoted message
+    const explicitIdMatch = text.match(/\b(AP-[A-F0-9]{4})\b/i);
+    const explicitRequestId = explicitIdMatch ? explicitIdMatch[1].toUpperCase() : undefined;
+    const quotedRowByMsgId = quotedMessageId
+      ? this.store.getRequestByOutboundMsgId(quotedMessageId)
+      : undefined;
+    const effectiveQuotedId = quotedRequestId
+      ? String(quotedRequestId).toUpperCase()
+      : quotedRowByMsgId?.request_id;
+
     const activeReq = this.store.getActiveRequest();
 
-    // Check if the active request has already passed its expiration deadline
-    if (activeReq && Date.now() >= activeReq.expires_at) {
-      const { transitioned, request: expiredReq } = this.store.transitionState({
-        requestId: activeReq.request_id,
-        toState: STATES.EXPIRED,
-        decision: STATES.EXPIRED,
-        humanInstructions: 'Request timed out without human decision (Fail-Closed).',
-        eventType: 'REQUEST_EXPIRED',
-      });
-      if (transitioned && expiredReq) {
-        this._resolveWaiters(activeReq.request_id, expiredReq);
-      }
-
-      // Now treat the late message as arriving when no active request is waiting
-      this.store.logAudit({
-        requestId: activeReq.request_id,
-        eventType: 'LATE_MESSAGE_AFTER_EXPIRATION',
-        messageId,
-        senderId,
-        fromState: STATES.EXPIRED,
-        toState: STATES.EXPIRED,
-        details: { text, channel },
-      });
-      await this.provider.sendText(
-        '⚠️ No active request waiting (or request already closed). Ignored.'
-      );
-      return;
-    }
-
-    // If no request is currently active in NOTIFIED or AWAITING_CONFIRMATION
+    // If no active request is waiting in NOTIFIED or AWAITING_CONFIRMATION
     if (!activeReq || !ACTIVE_WAITING_STATES.has(activeReq.state)) {
+      const targetClosedId = effectiveQuotedId || explicitRequestId;
       this.store.logAudit({
-        requestId: quotedRequestId || null,
+        requestId: targetClosedId || newlyExpired[0]?.request_id || null,
         eventType: 'NO_ACTIVE_REQUEST_IGNORED',
         messageId,
         senderId,
-        details: { text, channel, quotedRequestId },
+        details: { text, channel, quotedRequestId: effectiveQuotedId, explicitRequestId },
+        now,
       });
-      await this.provider.sendText(
-        '⚠️ No active request waiting (or request already closed). Ignored.'
-      );
+
+      if (targetClosedId) {
+        await this.provider.sendText(`⚠️ That request ([${targetClosedId}]) is already closed.`);
+      } else {
+        await this.provider.sendText(
+          '⚠️ No active request waiting (or request already closed). Ignored.'
+        );
+      }
       return;
     }
 
-    // 4. Swipe-reply / Quote Correlation Verification:
-    // If the user quoted an older message whose request_id or outbound_msg_id doesn't match activeReq
-    const explicitIdMatch = text.match(/\b(AP-[A-F0-9]{4})\b/i);
-    const referencedRequestId =
-      quotedRequestId || (explicitIdMatch ? explicitIdMatch[1].toUpperCase() : undefined);
-
-    if (referencedRequestId && referencedRequestId !== activeReq.request_id) {
+    // 4. Rule 1 (Quoted Replies): Verify quoted message matches the currently active request
+    if (effectiveQuotedId && effectiveQuotedId !== activeReq.request_id) {
       this.store.logAudit({
         requestId: activeReq.request_id,
         eventType: 'STALE_QUOTE_CORRELATION_REJECTED',
@@ -765,14 +853,13 @@ export class ApprovalEngine {
         fromState: activeReq.state,
         toState: activeReq.state,
         details: {
-          referencedRequestId,
+          quotedRequestId: effectiveQuotedId,
           activeRequestId: activeReq.request_id,
           quotedMessageId,
         },
+        now,
       });
-      await this.provider.sendText(
-        `⚠️ Quoted or referenced request [${referencedRequestId}] is already closed. Active request is [${activeReq.request_id}].`
-      );
+      await this.provider.sendText(`⚠️ That request ([${effectiveQuotedId}]) is already closed.`);
       return;
     }
 
@@ -780,7 +867,7 @@ export class ApprovalEngine {
       quotedMessageId &&
       activeReq.outbound_msg_id &&
       quotedMessageId !== activeReq.outbound_msg_id &&
-      !referencedRequestId
+      !effectiveQuotedId
     ) {
       this.store.logAudit({
         requestId: activeReq.request_id,
@@ -793,28 +880,91 @@ export class ApprovalEngine {
           quotedMessageId,
           expectedOutboundMsgId: activeReq.outbound_msg_id,
         },
+        now,
       });
-      await this.provider.sendText(
-        '⚠️ No active request waiting (or request already closed). Ignored.'
-      );
+      await this.provider.sendText('⚠️ That request is already closed.');
       return;
     }
 
-    // 5. Handle open-ended human input requests (`request_human_input`)
+    // 5. Rule 2 (Explicit ID): If message contains AP-XXXX, verify it matches the active request
+    if (explicitRequestId && explicitRequestId !== activeReq.request_id) {
+      this.store.logAudit({
+        requestId: activeReq.request_id,
+        eventType: 'MISMATCHED_EXPLICIT_ID_REJECTED',
+        messageId,
+        senderId,
+        fromState: activeReq.state,
+        toState: activeReq.state,
+        details: {
+          explicitRequestId,
+          activeRequestId: activeReq.request_id,
+        },
+        now,
+      });
+      await this.provider.sendText(`⚠️ That request ([${explicitRequestId}]) is already closed.`);
+      return;
+    }
+
+    // 6. Rule 3 (Hands-Free Unquoted Text / Voice Note + 30s Stale-Reply Cooldown):
+    // Allow plain "Y", "N", modifications, or voice notes without AP-XXXX ONLY IF
+    // no other request expired or was cancelled within the last STALE_REPLY_COOLDOWN_MS (30s).
+    const isExplicitlyCorrelated =
+      effectiveQuotedId === activeReq.request_id ||
+      explicitRequestId === activeReq.request_id ||
+      (quotedMessageId && quotedMessageId === activeReq.outbound_msg_id);
+
+    if (!isExplicitlyCorrelated && this.staleReplyCooldownMs > 0) {
+      const recentClosed = this.store.getRecentExpiredOrCancelled();
+      if (
+        recentClosed &&
+        recentClosed.request_id !== activeReq.request_id &&
+        typeof recentClosed.closed_at === 'number' &&
+        now - recentClosed.closed_at < this.staleReplyCooldownMs
+      ) {
+        this.store.logAudit({
+          requestId: activeReq.request_id,
+          eventType: 'STALE_REPLY_COOLDOWN_BLOCKED',
+          messageId,
+          senderId,
+          fromState: activeReq.state,
+          toState: activeReq.state,
+          details: {
+            recentClosedId: recentClosed.request_id,
+            recentClosedState: recentClosed.state,
+            elapsedSinceCloseMs: now - recentClosed.closed_at,
+            cooldownMs: this.staleReplyCooldownMs,
+          },
+          now,
+        });
+
+        await this.provider.sendText(
+          `⚠️ Request [${recentClosed.request_id}] just closed. To reply to [${activeReq.request_id}], please include [${activeReq.request_id}] or swipe-to-reply.`
+        );
+        return;
+      }
+    }
+
+    // Immediately cancel the 60s wake-up escalation timer since a valid reply arrived
+    this._clearEscalationTimer(activeReq.request_id);
+
+    const safeText = redactSecrets(text);
+
+    // 7. Handle open-ended human input requests (`request_human_input`)
     if (activeReq.kind === 'HUMAN_INPUT') {
       if (channel === 'voice_note') {
-        await this.provider.sendText(`📝 *Heard:* _${text}_`);
+        await this.provider.sendText(`📝 *Heard:* "${safeText}"`);
       }
 
       const { transitioned, request: updatedReq } = this.store.transitionState({
         requestId: activeReq.request_id,
         toState: STATES.APPROVED,
         decision: 'ANSWERED',
-        humanInstructions: text,
+        humanInstructions: safeText,
         channel,
         messageId,
         senderId,
         eventType: 'HUMAN_INPUT_RECEIVED',
+        now,
       });
 
       if (transitioned && updatedReq) {
@@ -823,39 +973,37 @@ export class ApprovalEngine {
       return;
     }
 
-    // 6. Classify decision for approval requests
+    // 8. Classify decision for approval requests
     const intent = classifyDecision(text);
     const isHighRisk =
       activeReq.risk_level === 'HIGH' || activeReq.risk_level === 'CRITICAL';
 
     // Case A: Request is currently in NOTIFIED
     if (activeReq.state === STATES.NOTIFIED) {
-      // High-Risk Voice Safeguard (Section 4.2.3):
-      // For HIGH and CRITICAL risk requests, a voice note with APPROVE intent NEVER executes immediately.
+      // Section 3.3: High-Risk Voice Confirmation (AWAITING_CONFIRMATION)
       if (channel === 'voice_note' && isHighRisk && intent === 'APPROVE') {
-        this._clearEscalationTimer(activeReq.request_id);
-
         this.store.transitionState({
           requestId: activeReq.request_id,
           toState: STATES.AWAITING_CONFIRMATION,
           decision: null,
-          humanInstructions: text,
+          humanInstructions: safeText,
+          pendingTranscript: safeText,
           channel: 'voice_note',
           messageId,
           senderId,
           eventType: 'HIGH_RISK_VOICE_AWAITING_CONFIRMATION',
-          details: { transcript: text, riskLevel: activeReq.risk_level },
+          details: { transcript: safeText, riskLevel: activeReq.risk_level },
+          now,
         });
 
         await this.provider.sendText(
-          `📝 *Heard:* '${text}'\n⚠️ *High-Risk Action:* Reply *Y* to confirm execution or *N* to reject.`
+          `📝 Heard: "${safeText}"\n⚠️ High-risk action [${activeReq.request_id}]: Reply Y to confirm execution or N to reject.`
         );
         return;
       }
 
-      // For LOW/MEDIUM risk voice notes or non-APPROVE voice notes, echo transcript first
       if (channel === 'voice_note') {
-        await this.provider.sendText(`📝 *Heard:* _${text}_`);
+        await this.provider.sendText(`📝 Heard: "${safeText}"`);
       }
 
       const targetState =
@@ -871,11 +1019,12 @@ export class ApprovalEngine {
         requestId: activeReq.request_id,
         toState: targetState,
         decision: targetState,
-        humanInstructions: text,
+        humanInstructions: safeText,
         channel,
         messageId,
         senderId,
         eventType: `DECISION_${targetState}`,
+        now,
       });
 
       if (transitioned && updatedReq) {
@@ -884,7 +1033,7 @@ export class ApprovalEngine {
       return;
     }
 
-    // Case B: Request is currently in AWAITING_CONFIRMATION (waiting for explicit Y/N after high-risk voice note)
+    // Case B: Request is currently in AWAITING_CONFIRMATION
     if (activeReq.state === STATES.AWAITING_CONFIRMATION) {
       if (channel === 'voice_note' && intent === 'APPROVE') {
         this.store.logAudit({
@@ -894,10 +1043,11 @@ export class ApprovalEngine {
           senderId,
           fromState: STATES.AWAITING_CONFIRMATION,
           toState: STATES.AWAITING_CONFIRMATION,
-          details: { transcript: text },
+          details: { transcript: safeText },
+          now,
         });
         await this.provider.sendText(
-          '⚠️ *High-Risk Action:* Please send a *text* reply with *Y* to confirm execution or *N* to reject.'
+          `⚠️ High-risk action [${activeReq.request_id}]: Please send a text reply with Y to confirm execution or N to reject.`
         );
         return;
       }
@@ -907,12 +1057,14 @@ export class ApprovalEngine {
           ? STATES.APPROVED
           : intent === 'REJECT'
             ? STATES.REJECTED
-            : STATES.MODIFICATION_REQUESTED;
+            : intent === 'NEEDS_CLARIFICATION'
+              ? STATES.NEEDS_CLARIFICATION
+              : STATES.MODIFICATION_REQUESTED;
 
       const preservedInstructions =
         targetState === STATES.APPROVED
-          ? activeReq.human_instructions || text
-          : text;
+          ? activeReq.pending_transcript || activeReq.human_instructions || safeText
+          : safeText;
 
       const { transitioned, request: updatedReq } = this.store.transitionState({
         requestId: activeReq.request_id,
@@ -923,6 +1075,7 @@ export class ApprovalEngine {
         messageId,
         senderId,
         eventType: `CONFIRMED_${targetState}`,
+        now,
       });
 
       if (transitioned && updatedReq) {
@@ -947,4 +1100,3 @@ export class ApprovalEngine {
     await this.provider.destroy();
   }
 }
-

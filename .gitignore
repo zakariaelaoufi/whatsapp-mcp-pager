@@ -2,7 +2,11 @@ node_modules/
 .env
 .wwebjs_auth/
 .wwebjs_cache/
+*.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.ogg
 AGENT_SPEC.md

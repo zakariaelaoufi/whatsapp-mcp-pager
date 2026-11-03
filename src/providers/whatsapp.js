@@ -505,6 +505,10 @@ export class WhatsAppWebProvider extends NotificationProvider {
         const voiceMedia = await generateOpusVoiceNote(spokenPrompt);
         await this._sendTracked(voiceMedia, { sendAudioAsVoice: true });
         console.error(`[WhatsApp] Sent Opus voice note for [${requestId}].`);
+      } catch (ttsErr) {
+        console.error(
+          `[WhatsApp] TTS/Voice note failed for [${requestId}], falling back to text-only: ${ttsErr.message}`
+        );
       } finally {
         this.sendingBotVoiceNote = false;
         this.lastPromptSentTimestampSec = Math.floor(Date.now() / 1000);

@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { config } from './config.js';
+import { config, redactSecrets } from './config.js';
 import { createDatabase, STATES } from './db.js';
 import { ApprovalEngine } from './engine.js';
 import { WhatsAppWebProvider } from './providers/whatsapp.js';
@@ -17,25 +17,22 @@ const engine = new ApprovalEngine({
   store,
   provider,
   escalationTimeoutMs: config.escalationTimeoutMs,
+  staleReplyCooldownMs: config.staleReplyCooldownMs,
   quietHours: config.quietHours,
-  reminderCounter: config.reminderCounter,
+  reconcileOnInit: true, // Section 5.1: Mark orphaned active requests as EXPIRED_ON_SERVER_RESTART
 });
 
 const server = new McpServer({
-  name: 'whatsapp-hitl-mcp',
-  version: '2.0.0',
+  name: 'whatsapp-mcp-pager',
+  version: '2.1.0',
 });
 
 /**
  * Helper to create a 15-second MCP progress notification emitter for long-running HITL waits.
  */
 function createProgressHeartbeatHandler(extra, totalSeconds = 600) {
-  return async ({ requestId, state, elapsedSeconds, remainingCountdown }) => {
-    const msg =
-      remainingCountdown !== undefined
-        ? `[${requestId}] Countdown: ${remainingCountdown}s before sending WhatsApp reminder...`
-        : `Waiting for WhatsApp response on [${requestId}] (${state}, ${elapsedSeconds}s elapsed)...`;
-    console.error(`[MCP Heartbeat] ${msg}`);
+  return async ({ requestId, state, elapsedSeconds }) => {
+    console.error(`[MCP Heartbeat] Waiting on [${requestId}] (state=${state}, elapsed=${elapsedSeconds}s)`);
     const progressToken = extra?._meta?.progressToken;
     if (progressToken !== undefined && typeof extra?.sendNotification === 'function') {
       try {
@@ -45,7 +42,7 @@ function createProgressHeartbeatHandler(extra, totalSeconds = 600) {
             progressToken,
             progress: elapsedSeconds,
             total: totalSeconds,
-            message: msg,
+            message: `Waiting for WhatsApp response on [${requestId}] (${state}, ${elapsedSeconds}s elapsed)...`,
           },
         });
       } catch (err) {
@@ -58,7 +55,7 @@ function createProgressHeartbeatHandler(extra, totalSeconds = 600) {
 // 1. Tool: request_approval
 server.tool(
   'request_approval',
-  'Pause execution and request fail-closed human authorization via WhatsApp (formatted text + Opus voice note + 60s wake-up ring). Automatically redacts secrets and enforces high-risk voice confirmation.',
+  'Pause execution and request fail-closed human authorization via WhatsApp (formatted text + Opus voice note + 60s wake-up ring). Automatically redacts secrets, enforces server-side risk floor, and requires text confirmation for high-risk voice approvals.',
   {
     project: z.string().describe('Project or repository name (e.g., "inventory-service")'),
     summary: z.string().describe('Concise summary of what was completed and what needs approval'),
@@ -71,7 +68,7 @@ server.tool(
     risk_level: z
       .enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
       .default('HIGH')
-      .describe('Risk level of the proposed action (HIGH and CRITICAL require text confirmation for voice approvals)'),
+      .describe('Requested risk level (server enforces MAX(agent_requested_risk, server_derived_risk))'),
     timeout_seconds: z
       .number()
       .int()
@@ -102,7 +99,9 @@ server.tool(
         onHeartbeat: createProgressHeartbeatHandler(extra, timeout_seconds),
       });
 
+      const isBusy = result?.code === 'BUSY_ACTIVE_REQUEST';
       return {
+        isError: isBusy,
         content: [
           {
             type: 'text',
@@ -111,7 +110,8 @@ server.tool(
         ],
       };
     } catch (err) {
-      console.error('[MCP Tool Error] request_approval failed:', err.message);
+      const safeErr = redactSecrets(err?.message || String(err));
+      console.error('[MCP Tool Error] request_approval failed:', safeErr);
       return {
         isError: true,
         content: [
@@ -122,7 +122,7 @@ server.tool(
                 request_id: null,
                 final_state: STATES.DELIVERY_FAILED,
                 decision: STATES.DELIVERY_FAILED,
-                human_instructions: `Fail-Closed error: ${err.message}`,
+                human_instructions: `Fail-Closed error: ${safeErr}`,
                 channel: 'none',
               },
               null,
@@ -138,7 +138,7 @@ server.tool(
 // 2. Tool: wait_for_approval
 server.tool(
   'wait_for_approval',
-  'Resume waiting on an existing approval request_id without sending duplicate WhatsApp messages (useful if the IDE timed out earlier while the human was away).',
+  'Resume waiting on an existing active approval request_id without sending duplicate WhatsApp messages.',
   {
     request_id: z.string().describe('The short request ID (e.g., "AP-82F4") to resume waiting on'),
   },
@@ -147,6 +147,7 @@ server.tool(
       const existing = store.getRequest(request_id);
       const totalSeconds = existing?.timeout_seconds || 600;
       const result = await engine.waitForApproval(request_id, {
+        signal: extra?.signal,
         onHeartbeat: createProgressHeartbeatHandler(extra, totalSeconds),
       });
 
@@ -159,7 +160,8 @@ server.tool(
         ],
       };
     } catch (err) {
-      console.error('[MCP Tool Error] wait_for_approval failed:', err.message);
+      const safeErr = redactSecrets(err?.message || String(err));
+      console.error('[MCP Tool Error] wait_for_approval failed:', safeErr);
       return {
         isError: true,
         content: [
@@ -170,7 +172,7 @@ server.tool(
                 request_id,
                 final_state: STATES.EXPIRED,
                 decision: STATES.EXPIRED,
-                human_instructions: `Fail-Closed error: ${err.message}`,
+                human_instructions: `Fail-Closed error: ${safeErr}`,
                 channel: 'none',
               },
               null,
@@ -183,7 +185,79 @@ server.tool(
   }
 );
 
-// 3. Tool: request_human_input
+// 3. Tool: cancel_approval
+server.tool(
+  'cancel_approval',
+  'Explicitly cancel an active approval request_id, clear its timers, and notify the human on WhatsApp that no reply is needed.',
+  {
+    request_id: z.string().describe('The short request ID (e.g., "AP-82F4") to cancel'),
+    reason: z
+      .string()
+      .default('Cancelled by coding agent')
+      .describe('Reason for cancelling the request'),
+  },
+  async ({ request_id, reason = 'Cancelled by coding agent' }) => {
+    try {
+      const result = await engine.cancelRequest(request_id, reason);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      const safeErr = redactSecrets(err?.message || String(err));
+      console.error('[MCP Tool Error] cancel_approval failed:', safeErr);
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ error: safeErr, request_id }, null, 2),
+          },
+        ],
+      };
+    }
+  }
+);
+
+// 4. Tool: get_approval_status
+server.tool(
+  'get_approval_status',
+  'Return the current persisted state and decision details of an approval request_id without blocking.',
+  {
+    request_id: z.string().describe('The short request ID (e.g., "AP-82F4") to inspect'),
+  },
+  async ({ request_id }) => {
+    try {
+      const result = engine.getApprovalStatus(request_id);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (err) {
+      const safeErr = redactSecrets(err?.message || String(err));
+      console.error('[MCP Tool Error] get_approval_status failed:', safeErr);
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ error: safeErr, request_id }, null, 2),
+          },
+        ],
+      };
+    }
+  }
+);
+
+// 5. Tool: request_human_input
 server.tool(
   'request_human_input',
   'Ask the human developer an open-ended question on WhatsApp via text + Opus voice note and wait for their text or transcribed voice response.',
@@ -205,7 +279,9 @@ server.tool(
         onHeartbeat: createProgressHeartbeatHandler(extra, 600),
       });
 
+      const isBusy = result?.code === 'BUSY_ACTIVE_REQUEST';
       return {
+        isError: isBusy,
         content: [
           {
             type: 'text',
@@ -214,7 +290,8 @@ server.tool(
         ],
       };
     } catch (err) {
-      console.error('[MCP Tool Error] request_human_input failed:', err.message);
+      const safeErr = redactSecrets(err?.message || String(err));
+      console.error('[MCP Tool Error] request_human_input failed:', safeErr);
       return {
         isError: true,
         content: [
@@ -225,7 +302,7 @@ server.tool(
                 request_id: null,
                 final_state: STATES.DELIVERY_FAILED,
                 decision: STATES.DELIVERY_FAILED,
-                human_instructions: `Fail-Closed error: ${err.message}`,
+                human_instructions: `Fail-Closed error: ${safeErr}`,
                 channel: 'none',
               },
               null,
@@ -238,10 +315,32 @@ server.tool(
   }
 );
 
+// Graceful shutdown on SIGINT / SIGTERM: cancel any active request before exiting
+let shuttingDown = false;
+async function handleShutdown(signalName) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[MCP] Received ${signalName}, cancelling active requests and shutting down...`);
+  try {
+    const activeRows = store.getAllActiveRequests();
+    for (const row of activeRows) {
+      await engine.cancelRequest(row.request_id, `Server received ${signalName}`);
+    }
+    await engine.destroy();
+    store.close();
+  } catch (err) {
+    console.error('[MCP] Shutdown cleanup error:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[MCP] Fail-Closed WhatsApp HITL MCP Server running on stdio.');
+  console.error('[MCP] Fail-Closed WhatsApp HITL MCP Server (whatsapp-mcp-pager) running on stdio.');
 }
 
 main().catch((err) => {
