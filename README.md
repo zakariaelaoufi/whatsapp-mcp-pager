@@ -24,8 +24,6 @@ You need **two WhatsApp accounts (two phone numbers)**:
 1. **Agent Number (Bot):** A spare phone number or secondary WhatsApp account. You will link this account via QR code (`npm run login`). The AI uses this number to message and call you.
 2. **Your Personal Number:** Your main WhatsApp on your phone (`MY_WHATSAPP_ID`). This is where you receive alerts and reply to your agent.
 
-> **Why two numbers?** WhatsApp does not let an account place a voice call to itself. Using a dedicated number for the agent lets it ring your phone and keeps the chat thread clean.
-
 You also need:
 - **Node.js 20+**
 - **OpenAI API Key** (for voice notes and Whisper transcription)
@@ -143,3 +141,4 @@ Add this to your MCP config (`~/.gemini/config/mcp_config.json` for Antigravity,
 - **`wait_for_approval`** (`request_id`) — Resumes waiting on an active request without sending duplicate alerts.
 - **`cancel_approval`** (`request_id`, `reason`) — Cancels an active request and lets you know on WhatsApp.
 - **`get_approval_status`** (`request_id`) — Checks the current status of a request without blocking.
+
