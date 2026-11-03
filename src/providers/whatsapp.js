@@ -420,6 +420,19 @@ export class WhatsAppWebProvider extends NotificationProvider {
     return base64Data;
   }
 
+  _isDetachedOrClosedError(err) {
+    const msg = String(err?.message || err || '');
+    return /detached Frame|Execution context was destroyed|Session closed|Target closed|Protocol error|Cannot read properties of null/i.test(
+      msg
+    );
+  }
+
+  async _recoverClientSession() {
+    console.error('[WhatsApp] Detected detached Puppeteer frame or closed session. Re-initializing client...');
+    await this.destroy();
+    await this.ensureReady();
+  }
+
   async _sendTracked(content, options = {}) {
     let lastError;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -437,7 +450,11 @@ export class WhatsAppWebProvider extends NotificationProvider {
         lastError = err;
         console.error(`[WhatsApp] Send attempt ${attempt} failed: ${err.message}`);
         if (attempt < 2) {
-          await new Promise((r) => setTimeout(r, 1500));
+          if (this._isDetachedOrClosedError(err)) {
+            await this._recoverClientSession();
+          } else {
+            await new Promise((r) => setTimeout(r, 1500));
+          }
         }
       }
     }
@@ -446,14 +463,21 @@ export class WhatsAppWebProvider extends NotificationProvider {
 
   async ensureReady() {
     validateConfig({ requireOpenAI: true });
-    const client = this.getClient();
 
-    if (this.isClientReady) {
-      await this._applyCompatibilityPatches();
-      await this._resolveTargetChatJids();
-      this._attachMessageListener();
-      return;
+    if (this.isClientReady && this.client?.pupPage) {
+      try {
+        await this.client.pupPage.evaluate(() => true);
+        await this._applyCompatibilityPatches();
+        await this._resolveTargetChatJids();
+        this._attachMessageListener();
+        return;
+      } catch (err) {
+        console.error('[WhatsApp] Health check detected stale page frame, recovering:', err.message);
+        await this.destroy();
+      }
     }
+
+    const client = this.getClient();
 
     if (!this.readyPromise) {
       this.readyPromise = new Promise((resolve, reject) => {
@@ -541,6 +565,7 @@ export class WhatsAppWebProvider extends NotificationProvider {
       this.client = null;
       this.isClientReady = false;
       this.readyPromise = null;
+      this._listenerAttached = false;
     }
   }
 }
