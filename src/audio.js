@@ -3,20 +3,19 @@ import os from 'node:os';
 import path from 'node:path';
 import OpenAI from 'openai';
 import wwebjs from 'whatsapp-web.js';
-import { config } from './config.js';
+import { config, hasOpenAIKey, hasSTTKey } from './config.js';
 import { redactSecrets } from './redact.js';
 
 const { MessageMedia } = wwebjs;
 
 function getOpenAIClient() {
-  return new OpenAI({
-    apiKey: config.openaiApiKey || process.env.OPENAI_API_KEY,
-  });
+  const apiKey = process.env.OPENAI_API_KEY?.trim() || config.openaiApiKey;
+  return new OpenAI({ apiKey });
 }
 
 function getSTTClientAndModel() {
-  const groqKey = config.groqApiKey || process.env.GROQ_API_KEY?.trim();
-  if (groqKey) {
+  const groqKey = process.env.GROQ_API_KEY?.trim() || config.groqApiKey;
+  if (groqKey && groqKey.length >= 10 && !groqKey.includes('...')) {
     return {
       client: new OpenAI({
         apiKey: groqKey,
@@ -34,10 +33,14 @@ function getSTTClientAndModel() {
 
 /**
  * Generates an Opus-encoded WhatsApp Voice Note (PTT) from spoken text.
+ * Returns `null` if `OPENAI_API_KEY` is not configured.
  * @param {string} spokenText
- * @returns {Promise<InstanceType<typeof MessageMedia>>}
+ * @returns {Promise<InstanceType<typeof MessageMedia> | null>}
  */
 export async function generateOpusVoiceNote(spokenText) {
+  if (!hasOpenAIKey()) {
+    return null;
+  }
   const openai = getOpenAIClient();
   const safeSpokenText = redactSecrets(spokenText);
 
@@ -60,6 +63,9 @@ export async function generateOpusVoiceNote(spokenText) {
  * @returns {Promise<string>}
  */
 export async function transcribeVoiceNote(base64OggData) {
+  if (!hasSTTKey()) {
+    throw new Error('No OPENAI_API_KEY or GROQ_API_KEY configured for voice note transcription.');
+  }
   const tempFilePath = path.join(
     os.tmpdir(),
     `whatsapp-ptt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.ogg`

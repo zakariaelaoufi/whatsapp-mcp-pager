@@ -1,6 +1,6 @@
 import wwebjs from 'whatsapp-web.js';
 import { generateOpusVoiceNote, transcribeVoiceNote } from '../audio.js';
-import { AUTH_DATA_PATH, config, validateConfig } from '../config.js';
+import { AUTH_DATA_PATH, config, hasOpenAIKey, hasSTTKey, validateConfig } from '../config.js';
 import { ringAndInterrupt } from '../wakeup.js';
 import { NotificationProvider } from './interface.js';
 
@@ -325,6 +325,15 @@ export class WhatsAppWebProvider extends NotificationProvider {
 
         if (isVoiceNote && isAllowedSender) {
           this.emitInboundActivity({ senderId: msg.from, channel: 'voice_note' });
+          if (!hasSTTKey()) {
+            console.error(
+              '[WhatsApp] Voice note received, but neither OPENAI_API_KEY nor GROQ_API_KEY is configured. Prompting user for text reply.'
+            );
+            await this._sendTracked(
+              '⚠️ Voice note transcription is disabled (no OPENAI_API_KEY or GROQ_API_KEY configured). Please reply with text (e.g., Y, N, or instructions).'
+            );
+            return;
+          }
           console.error('[WhatsApp] Voice note reply detected. Downloading & transcribing...');
           const base64Audio = await this._downloadVoiceNoteBase64(msg);
           text = await transcribeVoiceNote(base64Audio);
@@ -462,7 +471,7 @@ export class WhatsAppWebProvider extends NotificationProvider {
   }
 
   async ensureReady() {
-    validateConfig({ requireOpenAI: true });
+    validateConfig({ requireOpenAI: false });
 
     if (this.isClientReady && this.client?.pupPage) {
       try {
@@ -522,13 +531,15 @@ export class WhatsAppWebProvider extends NotificationProvider {
     console.error(`[WhatsApp] Sending prompt [${requestId}] to ${this.targetChatId}...`);
     const { outboundMsgId } = await this._sendTracked(formattedText);
 
-    if (spokenPrompt) {
+    if (spokenPrompt && hasOpenAIKey()) {
       this.sendingBotVoiceNote = true;
       try {
         console.error(`[WhatsApp] Generating Opus voice note for [${requestId}]...`);
         const voiceMedia = await generateOpusVoiceNote(spokenPrompt);
-        await this._sendTracked(voiceMedia, { sendAudioAsVoice: true });
-        console.error(`[WhatsApp] Sent Opus voice note for [${requestId}].`);
+        if (voiceMedia) {
+          await this._sendTracked(voiceMedia, { sendAudioAsVoice: true });
+          console.error(`[WhatsApp] Sent Opus voice note for [${requestId}].`);
+        }
       } catch (ttsErr) {
         console.error(
           `[WhatsApp] TTS/Voice note failed for [${requestId}], falling back to text-only: ${ttsErr.message}`
@@ -537,6 +548,10 @@ export class WhatsAppWebProvider extends NotificationProvider {
         this.sendingBotVoiceNote = false;
         this.lastPromptSentTimestampSec = Math.floor(Date.now() / 1000);
       }
+    } else if (spokenPrompt) {
+      console.error(
+        `[WhatsApp] OPENAI_API_KEY not set — skipping Opus voice note for [${requestId}] (text-only mode).`
+      );
     }
 
     return { outboundMsgId };

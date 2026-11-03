@@ -81,7 +81,7 @@ export const config = {
  * Validates required configuration via Zod with clear human-readable error messages.
  * Uses console.error exclusively to preserve MCP stdio JSON-RPC integrity.
  */
-export function validateConfig({ requireOpenAI = true, silent = false } = {}) {
+export function validateConfig({ requireOpenAI = false, silent = false } = {}) {
   const strictSchema = z
     .object({
       MY_WHATSAPP_ID: z
@@ -157,6 +157,24 @@ export function validateConfig({ requireOpenAI = true, silent = false } = {}) {
     }
     throw new Error(message);
   }
+}
+
+/**
+ * Returns true if a valid non-placeholder OPENAI_API_KEY is configured (for Opus TTS & OpenAI Whisper STT).
+ */
+export function hasOpenAIKey(key = process.env.OPENAI_API_KEY?.trim() || config.openaiApiKey) {
+  return Boolean(key && key.length >= 10 && key !== 'sk-proj-...' && !key.includes('...'));
+}
+
+/**
+ * Returns true if either GROQ_API_KEY or OPENAI_API_KEY is configured for voice-note STT transcription.
+ */
+export function hasSTTKey(
+  groqKey = process.env.GROQ_API_KEY?.trim() || config.groqApiKey,
+  openaiKey = process.env.OPENAI_API_KEY?.trim() || config.openaiApiKey
+) {
+  const validGroq = Boolean(groqKey && groqKey.length >= 10 && !groqKey.includes('...'));
+  return validGroq || hasOpenAIKey(openaiKey);
 }
 
 /**
