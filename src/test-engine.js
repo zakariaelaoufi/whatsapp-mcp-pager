@@ -3,17 +3,19 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { PROJECT_ROOT } from './config.js';
+import { isWithinQuietHours, PROJECT_ROOT, validateConfig } from './config.js';
 import { createDatabase, migrateApprovalRequestsSchema, STATES } from './db.js';
 import { ApprovalEngine, parseReply, classifyDecision } from './engine.js';
 import { computeEffectiveRisk } from './policy.js';
 import { MockProvider } from './providers/mock.js';
+import { ringAndInterrupt } from './wakeup.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function createTestHarness({
   escalationTimeoutMs = 5000,
   staleReplyCooldownMs = 30000,
+  countdownMs = 0,
   reconcileOnInit = false,
   store: existingStore = null,
 } = {}) {
@@ -24,6 +26,7 @@ function createTestHarness({
     provider,
     escalationTimeoutMs,
     staleReplyCooldownMs,
+    countdownMs,
     quietHours: '',
     reconcileOnInit,
   });
@@ -580,6 +583,84 @@ async function runTests() {
     assert.equal(destroyRes.reason, 'ENGINE_DESTROYED');
     console.error(
       '✅ 11. Schema migration helper, parseReply, computeEffectiveRisk, and idempotent destroy verified'
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 12: Auxiliary Modules (isWithinQuietHours, validateConfig, countdownMs, ringAndInterrupt fallback)
+  // ---------------------------------------------------------------------------
+  {
+    // 12a. Quiet hours evaluation (same-day and overnight spans)
+    const at0230 = new Date(2026, 10, 3, 2, 30, 0);
+    const at1400 = new Date(2026, 10, 3, 14, 0, 0);
+    const at2330 = new Date(2026, 10, 3, 23, 30, 0);
+
+    assert.equal(isWithinQuietHours(at0230, '23:00-07:00'), true, '02:30 is within 23:00-07:00');
+    assert.equal(isWithinQuietHours(at2330, '23:00-07:00'), true, '23:30 is within 23:00-07:00');
+    assert.equal(isWithinQuietHours(at1400, '23:00-07:00'), false, '14:00 is outside 23:00-07:00');
+    assert.equal(isWithinQuietHours(at1400, '13:00-15:00'), true, '14:00 is within 13:00-15:00');
+    assert.equal(isWithinQuietHours(at1400, ''), false, 'Empty quietHours returns false');
+
+    // 12b. validateConfig rejects placeholder values
+    const origWaId = process.env.MY_WHATSAPP_ID;
+    try {
+      process.env.MY_WHATSAPP_ID = '1XXXXXXXXXX@c.us';
+      assert.throws(
+        () => validateConfig({ requireOpenAI: false, silent: true }),
+        /MY_WHATSAPP_ID still contains placeholder/
+      );
+    } finally {
+      if (origWaId === undefined) delete process.env.MY_WHATSAPP_ID;
+      else process.env.MY_WHATSAPP_ID = origWaId;
+    }
+
+    // 12c. Pre-dispatch countdownMs delays prompt dispatch and respects pre-send cancellation
+    const { store, provider, engine } = createTestHarness();
+    const abortCtrl = new AbortController();
+    const countdownReqPromise = engine.requestApproval({
+      project: 'inventory-service',
+      summary: 'Countdown abort test',
+      commandOrDiff: 'echo countdown',
+      spokenPrompt: 'Countdown test',
+      riskLevel: 'LOW',
+      timeoutSeconds: 30,
+      countdownMs: 80,
+      signal: abortCtrl.signal,
+    });
+    await sleep(20);
+    assert.equal(provider.sentPrompts.length, 0, 'Prompt must not be sent while countdown is active');
+    abortCtrl.abort();
+    const countdownRes = await countdownReqPromise;
+    assert.equal(countdownRes.final_state, STATES.CANCELLED);
+    assert.equal(provider.sentPrompts.length, 0, 'Aborted countdown must never send a prompt');
+    await engine.destroy();
+    store.close();
+
+    // 12d. ringAndInterrupt falls back to 3 rapid buzzer messages when voice call button is missing
+    const sentBuzzers = [];
+    const mockWaClient = {
+      pupBrowser: {
+        isConnected: () => true,
+        defaultBrowserContext: () => ({ overridePermissions: async () => {} }),
+      },
+      pupPage: {
+        isClosed: () => false,
+        evaluate: async () => false, // Voice call button not found -> triggers buzzer fallback
+      },
+      sendMessage: async (_chatId, text) => {
+        sentBuzzers.push(text);
+        if (sentBuzzers.length === 1) {
+          // Abort after first buzzer so test finishes without waiting 3s
+          buzzerAbort.abort();
+        }
+      },
+    };
+    const buzzerAbort = new AbortController();
+    await ringAndInterrupt(mockWaClient, '14155552671@c.us', { signal: buzzerAbort.signal });
+    assert.equal(sentBuzzers[0], '🚨 RING!', 'Fallback buzzer must send 🚨 RING! on selector failure');
+
+    console.error(
+      '✅ 12. Auxiliary modules (isWithinQuietHours, validateConfig, countdownMs, ringAndInterrupt fallback) verified'
     );
   }
 
