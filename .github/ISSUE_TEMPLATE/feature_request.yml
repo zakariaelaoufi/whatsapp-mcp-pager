@@ -1,0 +1,74 @@
+name: 🚀 Feature Request
+description: Propose a new MCP tool, notification provider, safety policy, or workflow enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make **whatsapp-mcp-pager** better? Fill out the form below to propose a new feature or enhancement.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight Checklist
+      options:
+        - label: I have searched existing [Issues](https://github.com/zakariaelaoufi/whatsapp-mcp-pager/issues) and [Pull Requests](https://github.com/zakariaelaoufi/whatsapp-mcp-pager/pulls) to ensure this feature has not already been requested.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature Category
+      description: What area of the project does this proposal relate to?
+      options:
+        - "New MCP Tool or Schema Parameter"
+        - "New Notification Provider (e.g., Telegram, Slack, Signal, Discord)"
+        - "Voice / Audio (TTS / STT Models & Providers)"
+        - "Wake-Up Escalation & Quiet Hours"
+        - "Risk Escalation Policy (`src/policy.js`) & Secret Redaction (`src/redact.js`)"
+        - "State Machine & Reply Parsing (`src/engine.js`)"
+        - "Developer Experience, CLI & Documentation"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement / Use Case
+      description: What concrete problem or friction do you experience when controlling your AI coding agent remotely?
+      placeholder: "When I am away from my desk and running multiple agents across different repos..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe how the feature should work, including any new `.env` settings, MCP tool arguments, or WhatsApp reply syntax.
+      placeholder: "Add an optional parameter / command that..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Fail-Closed & Security Impact
+      description: |
+        `whatsapp-mcp-pager` is strictly fail-closed. How should this feature behave on timeout, crash, or ambiguous human input?
+      placeholder: "If the provider times out, it transitions to EXPIRED and never assumes approval..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you tried any workarounds or considered alternative designs?
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Willingness to Contribute
+      options:
+        - label: I would be willing to submit a Pull Request to implement this feature.

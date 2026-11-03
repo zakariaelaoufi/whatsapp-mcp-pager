@@ -1,0 +1,150 @@
+name: 🐛 Bug Report
+description: Report a defect, unexpected fail-closed state, WhatsApp session issue, or MCP transport error
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug in **whatsapp-mcp-pager**!
+        Please fill out the sections below so we can reproduce and resolve the issue quickly.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight Checklist
+      description: Please verify the following before submitting.
+      options:
+        - label: I have searched existing [Issues](https://github.com/zakariaelaoufi/whatsapp-mcp-pager/issues) to make sure this bug has not already been reported.
+          required: true
+        - label: I have verified that I am running **Node.js >= 20.0.0** (`node -v`).
+          required: true
+        - label: I have scrubbed all personal phone numbers (`MY_WHATSAPP_ID`), API keys, and tokens from my logs below.
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which part of the system is affected?
+      options:
+        - "MCP Server & Tools (src/index.js)"
+        - "Approval Engine & State Machine (src/engine.js)"
+        - "WhatsApp Web Provider / Puppeteer (src/providers/whatsapp.js)"
+        - "Voice Notes — OpenAI TTS / Whisper / Groq STT (src/audio.js)"
+        - "Wake-Up Call — Puppeteer Ring / Twilio Flash Call / Buzzer (src/wakeup.js)"
+        - "SQLite Persistence & Migrations (src/db.js)"
+        - "Risk Escalation Policy / Secret Redaction (src/policy.js, src/redact.js)"
+        - "QR Login / Session Auth (src/login.js)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: Provide a clear and concise description of the problem.
+      placeholder: "When the agent calls `request_approval` with a HIGH risk command and I reply via voice note..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps to reproduce the behavior.
+      value: |
+        1. Configure `.env` with `WAKEUP_MODE=...`
+        2. Trigger MCP tool `...` (or run `npm run test-pager`)
+        3. Send WhatsApp reply `...`
+        4. Observe error / unexpected state `...`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What state transition, WhatsApp message, or MCP tool response should have occurred?
+      placeholder: "Expected the request to transition to `AWAITING_CONFIRMATION` and prompt for a `Y` text reply."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior & Terminal State
+      description: What actually happened? Include the JSON payload returned to the AI agent if applicable.
+      placeholder: "The request transitioned to `DELIVERY_FAILED` / `EXPIRED`..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ide
+    attributes:
+      label: AI Coding Agent / IDE
+      description: Which MCP client are you using?
+      options:
+        - "Google Antigravity"
+        - "Cursor"
+        - "Claude Code (CLI)"
+        - "Claude Desktop"
+        - "Windsurf"
+        - "Standalone CLI (`npm run test-pager` / `npm test`)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - "Windows"
+        - "macOS"
+        - "Linux (Ubuntu / Debian / Arch / etc.)"
+        - "WSL2 (Windows Subsystem for Linux)"
+        - "Docker / Container"
+    validations:
+      required: true
+
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js Version
+      description: Output of `node -v`
+      placeholder: "v20.18.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wakeup_mode
+    attributes:
+      label: Wake-Up Mode (`WAKEUP_MODE`)
+      options:
+        - "puppeteer (WhatsApp Web 6s voice call)"
+        - "twilio (Cellular 6s flash call)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: audio_config
+    attributes:
+      label: Voice / Audio Configuration
+      options:
+        - "OpenAI TTS + OpenAI Whisper STT (OPENAI_API_KEY only)"
+        - "OpenAI TTS + Groq Whisper STT (OPENAI_API_KEY + GROQ_API_KEY)"
+        - "Groq STT only — Inbound voice notes, text-only outbound (GROQ_API_KEY only)"
+        - "Text-Only Mode (Neither OPENAI_API_KEY nor GROQ_API_KEY set)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant MCP Server Logs (stderr)
+      description: Paste any relevant log output from the MCP server or terminal. Do not include secrets or real phone numbers.
+      render: shell
+      placeholder: |
+        [WhatsApp] Sending prompt [AP-82F4] to 1415555XXXX@c.us...
+        [MCP Tool Error] ...
