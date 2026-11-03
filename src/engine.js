@@ -427,6 +427,11 @@ export class ApprovalEngine {
       clearTimeout(tracker.countdownTimer);
       tracker.countdownTimer = undefined;
     }
+    if (typeof tracker.countdownRelease === 'function') {
+      const release = tracker.countdownRelease;
+      tracker.countdownRelease = undefined;
+      release();
+    }
     if (tracker.escalationTimer) {
       clearTimeout(tracker.escalationTimer);
       tracker.escalationTimer = undefined;
@@ -616,8 +621,17 @@ export class ApprovalEngine {
 
     if (countdownMs > 0) {
       await new Promise((resolve) => {
+        tracker.countdownRelease = () => {
+          if (tracker.countdownTimer) {
+            clearTimeout(tracker.countdownTimer);
+            tracker.countdownTimer = undefined;
+          }
+          tracker.countdownRelease = undefined;
+          resolve();
+        };
         tracker.countdownTimer = setTimeout(() => {
           tracker.countdownTimer = undefined;
+          tracker.countdownRelease = undefined;
           resolve();
         }, countdownMs);
       });
@@ -737,95 +751,33 @@ export class ApprovalEngine {
   }
 
   /**
-   * Creates, dispatches, and waits for a formal approval request.
+   * Formats the standard `BUSY_ACTIVE_REQUEST` rejection payload when a concurrent request is active.
    */
-  async requestApproval({
-    project,
-    summary,
-    commandOrDiff,
-    spokenPrompt,
-    riskLevel = 'HIGH',
-    timeoutSeconds = 600,
-    countdownMs = this.countdownMs,
-    mcpWaitTimeoutMs = undefined,
-    signal = undefined,
-    onHeartbeat,
-  }) {
-    if (this._destroyed) {
-      return {
-        state: STATES.CANCELLED,
-        final_state: STATES.CANCELLED,
-        decision: STATES.CANCELLED,
-        code: STATES.CANCELLED,
-        reason: 'ENGINE_DESTROYED',
-      };
-    }
+  _buildBusyPayload(activeRow) {
+    return {
+      code: 'BUSY_ACTIVE_REQUEST',
+      error: 'BUSY_ACTIVE_REQUEST',
+      active_request_id: activeRow.id,
+      request_id: activeRow.id,
+      state: activeRow.state,
+      final_state: 'BUSY_ACTIVE_REQUEST',
+      decision: 'BUSY_ACTIVE_REQUEST',
+      human_instructions: `Another request [${activeRow.id}] is currently active (${activeRow.state}). Wait for it via wait_for_approval or cancel it via cancel_approval first.`,
+      channel: 'none',
+    };
+  }
 
-    // Section 5: Redact all fields BEFORE inserting into SQLite and BEFORE passing to provider/TTS
-    const redactedProject = redactSecrets(project);
-    const redactedSummary = redactSecrets(summary);
-    const redactedCommandOrDiff = redactSecrets(commandOrDiff);
-    const redactedSpokenPrompt = redactSecrets(spokenPrompt);
-
-    // Section 3: Compute server-side effective risk level (`MAX(agentRisk, derivedRisk)`)
-    const rawAgentRisk = String(riskLevel || 'HIGH').toUpperCase();
-    const effectiveRiskLevel = computeEffectiveRisk(rawAgentRisk, {
-      summary,
-      commandOrDiff,
-      project,
-    });
-    const { derivedRiskLevel, escalated } = evaluateRiskPolicy({
-      agentRiskLevel: rawAgentRisk,
-      commandOrDiff,
-      summary,
-      project,
-    });
-
-    // Section 2: Atomic One-Active-Request Lock + Creation inside a single synchronous SQLite transaction
-    const { busy, activeRow, request: req, newlyExpired } = this.store.acquireAndCreateRequest({
-      kind: 'APPROVAL',
-      project: redactedProject,
-      summary: redactedSummary,
-      commandOrDiff: redactedCommandOrDiff,
-      spokenPrompt: redactedSpokenPrompt,
-      agentRiskLevel: rawAgentRisk,
-      riskLevel: effectiveRiskLevel,
-      timeoutSeconds,
-    });
-
-    for (const expReq of newlyExpired) {
-      this._resolveWaiters(expReq.request_id, expReq);
-    }
-
-    if (busy && activeRow) {
-      return {
-        code: 'BUSY_ACTIVE_REQUEST',
-        error: 'BUSY_ACTIVE_REQUEST',
-        active_request_id: activeRow.id,
-        request_id: activeRow.id,
-        state: activeRow.state,
-        final_state: 'BUSY_ACTIVE_REQUEST',
-        decision: 'BUSY_ACTIVE_REQUEST',
-        human_instructions: `Another request [${activeRow.id}] is currently active (${activeRow.state}). Wait for it via wait_for_approval or cancel it via cancel_approval first.`,
-        channel: 'none',
-      };
-    }
-
-    if (escalated) {
-      this.store.logAudit({
-        requestId: req.request_id,
-        eventType: 'RISK_ESCALATED_BY_POLICY',
-        fromState: STATES.PENDING,
-        toState: STATES.PENDING,
-        details: {
-          agentRequestedRisk: rawAgentRisk,
-          derivedRiskLevel,
-          effectiveRiskLevel,
-        },
-      });
-    }
-
-    // Register full-lifecycle waiter & AbortSignal before countdown and sendPrompt
+  /**
+   * Shared lifecycle dispatcher for `requestApproval` and `requestHumanInput`:
+   * attaches abort signal + waiter promise, runs pre-dispatch countdown & deadline checks,
+   * dispatches via `provider.sendPrompt()`, handles in-flight cancellations/expirations/errors,
+   * transitions to `NOTIFIED`, and schedules escalation/expiration timers.
+   */
+  async _dispatchAndAwaitPrompt(
+    req,
+    formattedText,
+    { countdownMs = this.countdownMs, mcpWaitTimeoutMs = undefined, signal = undefined, onHeartbeat } = {}
+  ) {
     const tracker = this._getOrCreateTracker(req.request_id);
     const waitPromise = this._createWaitPromise(req.request_id, {
       onHeartbeat,
@@ -839,16 +791,6 @@ export class ApprovalEngine {
       return waitPromise;
     }
 
-    const formattedText = formatApprovalMessage({
-      requestId: req.request_id,
-      project: req.project,
-      riskLevel: req.risk_level,
-      timeoutSeconds: req.timeout_seconds,
-      summary: req.summary,
-      commandOrDiff: req.command_or_diff,
-    });
-
-    // Dispatch via NotificationProvider
     try {
       tracker.promptInFlight = true;
       const sendRes = await this.provider.sendPrompt({
@@ -919,6 +861,102 @@ export class ApprovalEngine {
     }
 
     return waitPromise;
+  }
+
+  /**
+   * Creates, dispatches, and waits for a formal approval request.
+   */
+  async requestApproval({
+    project,
+    summary,
+    commandOrDiff,
+    spokenPrompt,
+    riskLevel = 'HIGH',
+    timeoutSeconds = 600,
+    countdownMs = this.countdownMs,
+    mcpWaitTimeoutMs = undefined,
+    signal = undefined,
+    onHeartbeat,
+  }) {
+    if (this._destroyed) {
+      return {
+        state: STATES.CANCELLED,
+        final_state: STATES.CANCELLED,
+        decision: STATES.CANCELLED,
+        code: STATES.CANCELLED,
+        reason: 'ENGINE_DESTROYED',
+      };
+    }
+
+    // Section 5: Redact all fields BEFORE inserting into SQLite and BEFORE passing to provider/TTS
+    const redactedProject = redactSecrets(project);
+    const redactedSummary = redactSecrets(summary);
+    const redactedCommandOrDiff = redactSecrets(commandOrDiff);
+    const redactedSpokenPrompt = redactSecrets(spokenPrompt);
+
+    // Section 3: Compute server-side effective risk level (`MAX(agentRisk, derivedRisk)`)
+    const rawAgentRisk = String(riskLevel || 'HIGH').toUpperCase();
+    const effectiveRiskLevel = computeEffectiveRisk(rawAgentRisk, {
+      summary,
+      commandOrDiff,
+      project,
+    });
+    const { derivedRiskLevel, escalated } = evaluateRiskPolicy({
+      agentRiskLevel: rawAgentRisk,
+      commandOrDiff,
+      summary,
+      project,
+    });
+
+    // Section 2: Atomic One-Active-Request Lock + Creation inside a single synchronous SQLite transaction
+    const { busy, activeRow, request: req, newlyExpired } = this.store.acquireAndCreateRequest({
+      kind: 'APPROVAL',
+      project: redactedProject,
+      summary: redactedSummary,
+      commandOrDiff: redactedCommandOrDiff,
+      spokenPrompt: redactedSpokenPrompt,
+      agentRiskLevel: rawAgentRisk,
+      riskLevel: effectiveRiskLevel,
+      timeoutSeconds,
+    });
+
+    for (const expReq of newlyExpired) {
+      this._resolveWaiters(expReq.request_id, expReq);
+    }
+
+    if (busy && activeRow) {
+      return this._buildBusyPayload(activeRow);
+    }
+
+    if (escalated) {
+      this.store.logAudit({
+        requestId: req.request_id,
+        eventType: 'RISK_ESCALATED_BY_POLICY',
+        fromState: STATES.PENDING,
+        toState: STATES.PENDING,
+        details: {
+          agentRequestedRisk: rawAgentRisk,
+          derivedRiskLevel,
+          effectiveRiskLevel,
+        },
+      });
+    }
+
+    const formattedText = formatApprovalMessage({
+      requestId: req.request_id,
+      project: req.project,
+      riskLevel: req.risk_level,
+      timeoutSeconds: req.timeout_seconds,
+      summary: req.summary,
+      commandOrDiff: req.command_or_diff,
+    });
+
+    return this._dispatchAndAwaitPrompt(req, formattedText, {
+      countdownMs,
+      mcpWaitTimeoutMs,
+      signal,
+      onHeartbeat,
+    });
   }
 
   /**
@@ -1095,29 +1133,7 @@ export class ApprovalEngine {
     }
 
     if (busy && activeRow) {
-      return {
-        code: 'BUSY_ACTIVE_REQUEST',
-        error: 'BUSY_ACTIVE_REQUEST',
-        active_request_id: activeRow.id,
-        request_id: activeRow.id,
-        state: activeRow.state,
-        final_state: 'BUSY_ACTIVE_REQUEST',
-        decision: 'BUSY_ACTIVE_REQUEST',
-        human_instructions: `Another request [${activeRow.id}] is currently active (${activeRow.state}). Wait for it via wait_for_approval or cancel it via cancel_approval first.`,
-        channel: 'none',
-      };
-    }
-
-    const tracker = this._getOrCreateTracker(req.request_id);
-    const waitPromise = this._createWaitPromise(req.request_id, {
-      onHeartbeat,
-      mcpWaitTimeoutMs,
-    });
-    this._attachLifecycleAbortSignal(req.request_id, signal);
-
-    const countdownCheck = await this._runCountdownAndCheckDeadline(req, countdownMs);
-    if (!countdownCheck.proceed) {
-      return waitPromise;
+      return this._buildBusyPayload(activeRow);
     }
 
     const formattedText = formatHumanInputMessage({
@@ -1127,75 +1143,12 @@ export class ApprovalEngine {
       question: req.summary,
     });
 
-    try {
-      tracker.promptInFlight = true;
-      const sendRes = await this.provider.sendPrompt({
-        requestId: req.request_id,
-        formattedText,
-        spokenPrompt: req.spoken_prompt,
-      });
-      tracker.promptInFlight = false;
-      tracker.promptDispatched = true;
-
-      const providerMessageId =
-        sendRes?.providerMessageId || sendRes?.outboundMsgId || null;
-
-      const currentAfterSend = this.store.getRequest(req.request_id);
-      if (!currentAfterSend || TERMINAL_STATES.has(currentAfterSend.state)) {
-        if (currentAfterSend?.state === STATES.CANCELLED && !this._destroyed) {
-          try {
-            await this.provider.sendText(
-              `🚫 Request [${req.request_id}] was cancelled (${currentAfterSend.human_instructions || 'Cancelled'}). No reply needed.`
-            );
-          } catch {
-            // Ignore best-effort notice error
-          }
-        }
-        return waitPromise;
-      }
-
-      if (Date.now() >= currentAfterSend.expires_at) {
-        const { request: expiredReq } = this.store.transitionState({
-          requestId: req.request_id,
-          toState: STATES.EXPIRED,
-          decision: STATES.EXPIRED,
-          providerMessageId,
-          outboundMsgId: providerMessageId,
-          humanInstructions: 'Request timed out during dispatch (Fail-Closed).',
-          eventType: 'REQUEST_EXPIRED',
-        });
-        this._resolveWaiters(req.request_id, expiredReq);
-        return waitPromise;
-      }
-
-      const { request: notifiedReq } = this.store.transitionState({
-        requestId: req.request_id,
-        toState: STATES.NOTIFIED,
-        providerMessageId,
-        outboundMsgId: providerMessageId,
-        eventType: 'PROMPT_DISPATCHED',
-      });
-
-      this._scheduleTimers(notifiedReq);
-    } catch (deliveryErr) {
-      tracker.promptInFlight = false;
-      const currentAfterErr = this.store.getRequest(req.request_id);
-      if (currentAfterErr && !TERMINAL_STATES.has(currentAfterErr.state)) {
-        const safeErrMsg = redactSecrets(deliveryErr?.message || String(deliveryErr));
-        const { request: failedReq } = this.store.transitionState({
-          requestId: req.request_id,
-          toState: STATES.DELIVERY_FAILED,
-          decision: STATES.DELIVERY_FAILED,
-          humanInstructions: `Delivery failed (Fail-Closed): ${safeErrMsg}`,
-          eventType: 'DELIVERY_FAILED',
-          details: { error: safeErrMsg },
-        });
-        this._resolveWaiters(req.request_id, failedReq);
-      }
-      return waitPromise;
-    }
-
-    return waitPromise;
+    return this._dispatchAndAwaitPrompt(req, formattedText, {
+      countdownMs,
+      mcpWaitTimeoutMs,
+      signal,
+      onHeartbeat,
+    });
   }
 
   /**
