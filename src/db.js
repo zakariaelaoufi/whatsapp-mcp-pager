@@ -72,6 +72,65 @@ export function generateRequestId() {
 }
 
 /**
+ * Normalizes a database row so both `row.id` / `row.request_id` and
+ * `row.provider_message_id` / `row.outbound_msg_id` are always available.
+ */
+function normalizeRow(row) {
+  if (!row) return undefined;
+  const reqId = row.request_id || row.id;
+  const providerMsgId = row.provider_message_id ?? row.outbound_msg_id ?? null;
+  return {
+    ...row,
+    id: reqId,
+    request_id: reqId,
+    provider_message_id: providerMsgId,
+    outbound_msg_id: providerMsgId,
+  };
+}
+
+/**
+ * Idempotent startup schema migration helper using `PRAGMA table_info(approval_requests)`.
+ * Adds any missing columns on existing SQLite databases so upgrading never loses data.
+ *
+ * @param {import('better-sqlite3').Database} db
+ */
+export function migrateApprovalRequestsSchema(db) {
+  const columns = new Set(
+    db
+      .prepare(`PRAGMA table_info(approval_requests)`)
+      .all()
+      .map((col) => col.name)
+  );
+
+  const requiredMigrations = [
+    { name: 'internal_id', ddl: `ALTER TABLE approval_requests ADD COLUMN internal_id TEXT NOT NULL DEFAULT ''` },
+    { name: 'kind', ddl: `ALTER TABLE approval_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'APPROVAL'` },
+    { name: 'agent_risk_level', ddl: `ALTER TABLE approval_requests ADD COLUMN agent_risk_level TEXT` },
+    { name: 'risk_level', ddl: `ALTER TABLE approval_requests ADD COLUMN risk_level TEXT NOT NULL DEFAULT 'HIGH'` },
+    { name: 'pending_transcript', ddl: `ALTER TABLE approval_requests ADD COLUMN pending_transcript TEXT` },
+    { name: 'provider_message_id', ddl: `ALTER TABLE approval_requests ADD COLUMN provider_message_id TEXT` },
+    { name: 'outbound_msg_id', ddl: `ALTER TABLE approval_requests ADD COLUMN outbound_msg_id TEXT` },
+    { name: 'closed_at', ddl: `ALTER TABLE approval_requests ADD COLUMN closed_at INTEGER` },
+  ];
+
+  for (const col of requiredMigrations) {
+    if (!columns.has(col.name)) {
+      db.exec(col.ddl);
+    }
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_approval_requests_provider_msg_id
+      ON approval_requests(provider_message_id)
+      WHERE provider_message_id IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_approval_requests_outbound_msg_id
+      ON approval_requests(outbound_msg_id)
+      WHERE outbound_msg_id IS NOT NULL;
+  `);
+}
+
+/**
  * Creates and initializes a SQLite persistence store (WAL mode) for HITL requests and audit events.
  *
  * @param {string} [dbPath] Path to SQLite file, or ':memory:' for deterministic tests
@@ -90,13 +149,14 @@ export function createDatabase(dbPath = config.dbPath) {
       summary TEXT NOT NULL,
       command_or_diff TEXT NOT NULL DEFAULT '',
       spoken_prompt TEXT NOT NULL,
-      agent_risk_level TEXT NOT NULL DEFAULT 'HIGH',
+      agent_risk_level TEXT,
       risk_level TEXT NOT NULL DEFAULT 'HIGH',
       state TEXT NOT NULL,
       decision TEXT,
       human_instructions TEXT,
       pending_transcript TEXT,
       channel TEXT,
+      provider_message_id TEXT,
       outbound_msg_id TEXT,
       timeout_seconds INTEGER NOT NULL DEFAULT 600,
       created_at INTEGER NOT NULL,
@@ -128,31 +188,7 @@ export function createDatabase(dbPath = config.dbPath) {
       ON audit_events(request_id, created_at ASC);
   `);
 
-  // Safe schema migration for existing SQLite databases created by earlier versions
-  const existingCols = new Set(
-    db
-      .prepare(`PRAGMA table_info(approval_requests)`)
-      .all()
-      .map((c) => c.name)
-  );
-  if (!existingCols.has('internal_id')) {
-    db.exec(`ALTER TABLE approval_requests ADD COLUMN internal_id TEXT NOT NULL DEFAULT ''`);
-  }
-  if (!existingCols.has('agent_risk_level')) {
-    db.exec(`ALTER TABLE approval_requests ADD COLUMN agent_risk_level TEXT NOT NULL DEFAULT 'HIGH'`);
-  }
-  if (!existingCols.has('pending_transcript')) {
-    db.exec(`ALTER TABLE approval_requests ADD COLUMN pending_transcript TEXT`);
-  }
-  if (!existingCols.has('closed_at')) {
-    db.exec(`ALTER TABLE approval_requests ADD COLUMN closed_at INTEGER`);
-  }
-
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_approval_requests_outbound_msg_id
-      ON approval_requests(outbound_msg_id)
-      WHERE outbound_msg_id IS NOT NULL;
-  `);
+  migrateApprovalRequestsSchema(db);
 
   const insertRequestStmt = db.prepare(`
     INSERT INTO approval_requests (
@@ -168,8 +204,10 @@ export function createDatabase(dbPath = config.dbPath) {
     SELECT * FROM approval_requests WHERE request_id = ?
   `);
 
-  const getRequestByOutboundMsgIdStmt = db.prepare(`
-    SELECT * FROM approval_requests WHERE outbound_msg_id = ? LIMIT 1
+  const getRequestByProviderMsgIdStmt = db.prepare(`
+    SELECT * FROM approval_requests
+    WHERE provider_message_id = ? OR outbound_msg_id = ?
+    LIMIT 1
   `);
 
   const getActiveWaitingRequestStmt = db.prepare(`
@@ -202,8 +240,7 @@ export function createDatabase(dbPath = config.dbPath) {
   const getRecentExpiredOrCancelledStmt = db.prepare(`
     SELECT * FROM approval_requests
     WHERE state IN ('EXPIRED', 'CANCELLED')
-      AND closed_at IS NOT NULL
-    ORDER BY closed_at DESC
+    ORDER BY updated_at DESC
     LIMIT 1
   `);
 
@@ -214,6 +251,7 @@ export function createDatabase(dbPath = config.dbPath) {
         human_instructions = COALESCE(@human_instructions, human_instructions),
         pending_transcript = COALESCE(@pending_transcript, pending_transcript),
         channel = COALESCE(@channel, channel),
+        provider_message_id = COALESCE(@provider_message_id, provider_message_id),
         outbound_msg_id = COALESCE(@outbound_msg_id, outbound_msg_id),
         updated_at = @updated_at,
         closed_at = COALESCE(@closed_at, closed_at)
@@ -285,6 +323,7 @@ export function createDatabase(dbPath = config.dbPath) {
       humanInstructions = null,
       pendingTranscript = null,
       channel = null,
+      providerMessageId = null,
       outboundMsgId = null,
       messageId = null,
       senderId = null,
@@ -310,7 +349,11 @@ export function createDatabase(dbPath = config.dbPath) {
           details: { reason: `Request ${requestId} is already in terminal state ${fromState}` },
           now,
         });
-        return { transitioned: false, reason: 'ALREADY_TERMINAL', request: current };
+        return {
+          transitioned: false,
+          reason: 'ALREADY_TERMINAL',
+          request: normalizeRow(current),
+        };
       }
 
       const allowedTargets = ALLOWED_TRANSITIONS[fromState];
@@ -336,6 +379,7 @@ export function createDatabase(dbPath = config.dbPath) {
         pendingTranscript !== null && pendingTranscript !== undefined
           ? redactSecrets(pendingTranscript)
           : null;
+      const effectiveProviderMsgId = providerMessageId ?? outboundMsgId ?? null;
 
       const result = updateStateStmt.run({
         request_id: requestId,
@@ -345,7 +389,8 @@ export function createDatabase(dbPath = config.dbPath) {
         human_instructions: safeHumanInstructions,
         pending_transcript: safePendingTranscript,
         channel,
-        outbound_msg_id: outboundMsgId,
+        provider_message_id: effectiveProviderMsgId,
+        outbound_msg_id: effectiveProviderMsgId,
         updated_at: now,
         closed_at: isTerminalTarget ? now : null,
       });
@@ -354,7 +399,7 @@ export function createDatabase(dbPath = config.dbPath) {
         return {
           transitioned: false,
           reason: 'CONCURRENT_MODIFICATION',
-          request: getRequestStmt.get(requestId),
+          request: normalizeRow(getRequestStmt.get(requestId)),
         };
       }
 
@@ -378,7 +423,7 @@ export function createDatabase(dbPath = config.dbPath) {
         transitioned: true,
         fromState,
         toState,
-        request: getRequestStmt.get(requestId),
+        request: normalizeRow(getRequestStmt.get(requestId)),
       };
     }
   );
@@ -406,7 +451,7 @@ export function createDatabase(dbPath = config.dbPath) {
   });
 
   /**
-   * Section 5.1: On server start, query all rows in PENDING, NOTIFIED, or AWAITING_CONFIRMATION
+   * Startup recovery: query all rows in PENDING, NOTIFIED, or AWAITING_CONFIRMATION
    * and transition them to EXPIRED with audit reason "EXPIRED_ON_SERVER_RESTART".
    */
   const reconcileOnStartup = db.transaction((now = Date.now()) => {
@@ -430,71 +475,111 @@ export function createDatabase(dbPath = config.dbPath) {
   });
 
   /**
-   * Creates a new approval request in PENDING state inside a transaction.
-   * Generates both `internal_id` (UUID v4) and short reference (`AP-XXXX`).
+   * Internal helper to insert a new request row (assumes caller is inside a transaction).
    */
-  const createRequest = db.transaction(
-    ({
-      requestId,
-      internalId,
-      kind = 'APPROVAL',
-      project,
-      summary,
-      commandOrDiff = '',
-      spokenPrompt,
-      agentRiskLevel = 'HIGH',
-      riskLevel = 'HIGH',
-      timeoutSeconds = 600,
-      now = Date.now(),
-    }) => {
-      let id = requestId ? String(requestId).toUpperCase() : generateRequestId();
-      while (getRequestStmt.get(id)) {
-        id = generateRequestId();
-      }
+  function _insertNewRequest({
+    requestId,
+    internalId,
+    kind = 'APPROVAL',
+    project,
+    summary,
+    commandOrDiff = '',
+    spokenPrompt,
+    agentRiskLevel = 'HIGH',
+    riskLevel = 'HIGH',
+    timeoutSeconds = 600,
+    now = Date.now(),
+  }) {
+    let id = requestId ? String(requestId).toUpperCase() : generateRequestId();
+    while (getRequestStmt.get(id)) {
+      id = generateRequestId();
+    }
 
-      const uuid = internalId || crypto.randomUUID();
-      const expiresAt = now + timeoutSeconds * 1000;
+    const uuid = internalId || crypto.randomUUID();
+    const expiresAt = now + timeoutSeconds * 1000;
 
-      const safeSummary = redactSecrets(summary);
-      const safeCommandOrDiff = redactSecrets(commandOrDiff);
-      const safeSpokenPrompt = redactSecrets(spokenPrompt);
+    const safeProject = redactSecrets(project);
+    const safeSummary = redactSecrets(summary);
+    const safeCommandOrDiff = redactSecrets(commandOrDiff);
+    const safeSpokenPrompt = redactSecrets(spokenPrompt);
 
-      insertRequestStmt.run({
-        request_id: id,
-        internal_id: uuid,
+    insertRequestStmt.run({
+      request_id: id,
+      internal_id: uuid,
+      kind,
+      project: safeProject,
+      summary: safeSummary,
+      command_or_diff: safeCommandOrDiff,
+      spoken_prompt: safeSpokenPrompt,
+      agent_risk_level: agentRiskLevel ?? null,
+      risk_level: riskLevel,
+      state: STATES.PENDING,
+      timeout_seconds: timeoutSeconds,
+      created_at: now,
+      updated_at: now,
+      expires_at: expiresAt,
+    });
+
+    logAudit({
+      requestId: id,
+      eventType: 'REQUEST_CREATED',
+      fromState: null,
+      toState: STATES.PENDING,
+      details: {
+        internalId: uuid,
+        project: safeProject,
+        agentRiskLevel,
+        riskLevel,
+        timeoutSeconds,
         kind,
-        project: redactSecrets(project),
-        summary: safeSummary,
-        command_or_diff: safeCommandOrDiff,
-        spoken_prompt: safeSpokenPrompt,
-        agent_risk_level: agentRiskLevel,
-        risk_level: riskLevel,
-        state: STATES.PENDING,
-        timeout_seconds: timeoutSeconds,
-        created_at: now,
-        updated_at: now,
-        expires_at: expiresAt,
-      });
+      },
+      now,
+    });
 
+    return normalizeRow(getRequestStmt.get(id));
+  }
+
+  /**
+   * Creates a new approval request in PENDING state inside a transaction.
+   */
+  const createRequest = db.transaction((params) => _insertNewRequest(params));
+
+  /**
+   * Section 2: Atomic One-Active-Request Lock + Creation inside a single synchronous SQLite transaction:
+   * 1. Expire any overdue requests where `state IN ('PENDING', 'NOTIFIED', 'AWAITING_CONFIRMATION') AND expires_at <= ?`.
+   * 2. Query for any remaining row where `state IN ('PENDING', 'NOTIFIED', 'AWAITING_CONFIRMATION')`.
+   * 3. If found, do NOT insert a new row; return `{ busy: true, activeRow, newlyExpired }`.
+   * 4. Otherwise, insert the new request row in `PENDING` state and return `{ busy: false, request, newlyExpired }`.
+   */
+  const acquireAndCreateRequest = db.transaction((params = {}) => {
+    const now = params.now ?? Date.now();
+    const newlyExpired = sweepExpiredRequests(now);
+
+    const activeRow = normalizeRow(getAnyActiveRequestStmt.get());
+    if (activeRow) {
       logAudit({
-        requestId: id,
-        eventType: 'REQUEST_CREATED',
-        fromState: null,
-        toState: STATES.PENDING,
-        details: {
-          internalId: uuid,
-          project,
-          agentRiskLevel,
-          riskLevel,
-          timeoutSeconds,
-          kind,
-        },
+        requestId: activeRow.request_id,
+        eventType: 'BUSY_ACTIVE_REQUEST_REJECTED',
+        fromState: activeRow.state,
+        toState: activeRow.state,
+        details: { activeRequestId: activeRow.request_id, state: activeRow.state },
         now,
       });
 
-      return getRequestStmt.get(id);
+      return {
+        busy: true,
+        activeRow,
+        newlyExpired,
+      };
     }
-  );
+
+    const request = _insertNewRequest({ ...params, now });
+    return {
+      busy: false,
+      request,
+      newlyExpired,
+    };
+  });
 
   /**
    * Checks whether an inbound WhatsApp message ID has already been processed.
@@ -507,24 +592,36 @@ export function createDatabase(dbPath = config.dbPath) {
   return {
     db,
     createRequest,
+    acquireAndCreateRequest,
     transitionState,
     sweepExpiredRequests,
     reconcileOnStartup,
     logAudit,
     isMessageProcessed,
-    getRequest: (id) => (id ? getRequestStmt.get(String(id).toUpperCase()) : undefined),
-    getRequestByOutboundMsgId: (outboundMsgId) =>
-      outboundMsgId ? getRequestByOutboundMsgIdStmt.get(outboundMsgId) : undefined,
-    getActiveRequest: () => getActiveWaitingRequestStmt.get(),
+    getRequest: (id) =>
+      id ? normalizeRow(getRequestStmt.get(String(id).toUpperCase())) : undefined,
+    getRequestByOutboundMsgId: (msgId) =>
+      msgId ? normalizeRow(getRequestByProviderMsgIdStmt.get(msgId, msgId)) : undefined,
+    getRequestByProviderMsgId: (msgId) =>
+      msgId ? normalizeRow(getRequestByProviderMsgIdStmt.get(msgId, msgId)) : undefined,
+    getActiveRequest: () => normalizeRow(getActiveWaitingRequestStmt.get()),
     getBlockingActiveRequest: (now = Date.now()) => {
       sweepExpiredRequests(now);
-      return getAnyActiveRequestStmt.get();
+      return normalizeRow(getAnyActiveRequestStmt.get());
     },
-    getAllActiveRequests: () => getAllActiveRequestsStmt.all(),
-    getRecentExpiredOrCancelled: () => getRecentExpiredOrCancelledStmt.get(),
+    getAllActiveRequests: () => getAllActiveRequestsStmt.all().map(normalizeRow),
+    getRecentExpiredOrCancelled: () => normalizeRow(getRecentExpiredOrCancelledStmt.get()),
     getAuditEventsForRequest: (id) =>
       id ? getAuditEventsForRequestStmt.all(String(id).toUpperCase()) : [],
     getAllAuditEvents: () => getAllAuditEventsStmt.all(),
-    close: () => db.close(),
+    close: () => {
+      try {
+        if (db.open) {
+          db.close();
+        }
+      } catch {
+        // Ignore if already closed
+      }
+    },
   };
 }

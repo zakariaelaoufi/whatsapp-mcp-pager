@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { PROJECT_ROOT } from './config.js';
-import { createDatabase, STATES } from './db.js';
-import { ApprovalEngine } from './engine.js';
+import { createDatabase, migrateApprovalRequestsSchema, STATES } from './db.js';
+import { ApprovalEngine, parseReply, classifyDecision } from './engine.js';
+import { computeEffectiveRisk } from './policy.js';
 import { MockProvider } from './providers/mock.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -320,8 +322,28 @@ async function runTests() {
       'Unquoted Y within 30s cooldown after previous expiration must be blocked'
     );
     assert.ok(
-      provider.sentTexts.some((m) => m.text.includes(`please include [${activeR2.request_id}]`)),
+      provider.sentTexts.some((m) =>
+        m.text.includes(
+          '⚠️ A previous request recently closed. Please swipe-to-reply to the current message or include the ID (e.g., Y AP-'
+        )
+      ),
       'User must be prompted to include the new request ID or swipe-to-reply'
+    );
+
+    // Sending only the request ID ("AP-XXXX") with empty decisionText must be ignored and prompt for decision
+    await provider.simulateInbound({
+      messageId: 'id_only_no_decision',
+      channel: 'text',
+      text: `${activeR2.request_id}`,
+    });
+    assert.equal(
+      store.getRequest(activeR2.request_id).state,
+      STATES.NOTIFIED,
+      'Message with only AP-XXXX and empty decisionText must not resolve request'
+    );
+    assert.ok(
+      provider.sentTexts.some((m) => m.text.includes('Please include a decision')),
+      'User must be prompted to include a decision when only AP-XXXX is sent'
     );
 
     // Also test Rule 1: quoting the old closed request R1 rejects with "already closed"
@@ -480,7 +502,79 @@ async function runTests() {
     );
   }
 
-  console.error('\n🎉 All 10 Hardened Fail-Closed HITL specifications passed deterministically!');
+  // ---------------------------------------------------------------------------
+  // Test 11: Schema Migration Helper, parseReply, computeEffectiveRisk, Deadline & Clean Shutdown
+  // ---------------------------------------------------------------------------
+  {
+    // 11a. Legacy schema migration adds missing columns idempotently
+    const rawDb = new Database(':memory:');
+    rawDb.exec(`
+      CREATE TABLE approval_requests (
+        request_id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        command_or_diff TEXT NOT NULL,
+        spoken_prompt TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `);
+    migrateApprovalRequestsSchema(rawDb);
+    migrateApprovalRequestsSchema(rawDb); // Idempotent second run
+    const cols = rawDb.pragma('table_info(approval_requests)').map((c) => c.name);
+    assert.ok(cols.includes('agent_risk_level'));
+    assert.ok(cols.includes('pending_transcript'));
+    assert.ok(cols.includes('provider_message_id'));
+    rawDb.close();
+
+    // 11b. parseReply strips AP-XXXX and punctuation before classifyDecision
+    const parsed1 = parseReply('Y AP-82F4');
+    assert.equal(parsed1.requestId, 'AP-82F4');
+    assert.equal(parsed1.decisionText, 'Y');
+    assert.equal(classifyDecision(parsed1.decisionText), 'APPROVE');
+
+    const parsed2 = parseReply('AP-82F4: N');
+    assert.equal(parsed2.requestId, 'AP-82F4');
+    assert.equal(parsed2.decisionText, 'N');
+    assert.equal(classifyDecision(parsed2.decisionText), 'REJECT');
+
+    const parsedEmpty = parseReply('AP-82F4');
+    assert.equal(parsedEmpty.requestId, 'AP-82F4');
+    assert.equal(parsedEmpty.decisionText, '');
+
+    // 11c. computeEffectiveRisk escalates properly
+    assert.equal(
+      computeEffectiveRisk('LOW', { summary: 'drop', commandOrDiff: 'DROP TABLE users' }),
+      'CRITICAL'
+    );
+    assert.equal(
+      computeEffectiveRisk('LOW', { summary: 'publish package', commandOrDiff: 'npm publish' }),
+      'HIGH'
+    );
+
+    // 11d. Idempotent destroy() resolves pending waiters with ENGINE_DESTROYED
+    const { engine } = createTestHarness();
+    const pendingWait = engine.requestHumanInput({
+      project: 'inventory-service',
+      question: 'Which port should we use?',
+      spokenPrompt: 'Which port?',
+      timeoutSeconds: 60,
+    });
+    await sleep(15);
+    await engine.destroy();
+    await engine.destroy(); // Idempotent second call
+    const destroyRes = await pendingWait;
+    assert.equal(destroyRes.final_state, STATES.CANCELLED);
+    assert.equal(destroyRes.reason, 'ENGINE_DESTROYED');
+    console.error(
+      '✅ 11. Schema migration helper, parseReply, computeEffectiveRisk, and idempotent destroy verified'
+    );
+  }
+
+  console.error('\n🎉 All Hardened Fail-Closed HITL specifications passed deterministically!');
 }
 
 runTests().catch((err) => {

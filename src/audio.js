@@ -4,6 +4,7 @@ import path from 'node:path';
 import OpenAI from 'openai';
 import wwebjs from 'whatsapp-web.js';
 import { config } from './config.js';
+import { redactSecrets } from './redact.js';
 
 const { MessageMedia } = wwebjs;
 
@@ -38,11 +39,12 @@ function getSTTClientAndModel() {
  */
 export async function generateOpusVoiceNote(spokenText) {
   const openai = getOpenAIClient();
+  const safeSpokenText = redactSecrets(spokenText);
 
   const response = await openai.audio.speech.create({
     model: 'tts-1',
     voice: 'onyx',
-    input: spokenText,
+    input: safeSpokenText,
     response_format: 'opus',
   });
 

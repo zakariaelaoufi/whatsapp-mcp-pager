@@ -24,7 +24,7 @@ Pause your AI coding agent (Antigravity, Cursor, Claude Code, Windsurf, etc.) an
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/<your-username>/whatsapp-mcp-pager.git
+git clone https://github.com/zakariaelaoufi/whatsapp-mcp-pager.git
 cd whatsapp-mcp-pager
 npm install
 ```
@@ -45,6 +45,9 @@ cp .env.example .env
 # Your WhatsApp number in international format (no '+' or spaces), ending in @c.us
 MY_WHATSAPP_ID=14155552671@c.us
 
+# Optional: Your phone number in E.164 format for Twilio cellular wake-up calls
+MY_PHONE_E164=+14155552671
+
 # Required: OpenAI API Key (for Opus TTS voice notes & Whisper STT)
 OPENAI_API_KEY=sk-proj-...
 
@@ -54,11 +57,25 @@ GROQ_API_KEY=
 # "puppeteer" (WhatsApp Web 6s voice call) or "twilio" (cellular 6s flash call)
 WAKEUP_MODE=puppeteer
 
+# Optional: Twilio credentials (only required if WAKEUP_MODE=twilio)
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_FROM_NUMBER=
+
 # Escalation timeout before triggering the 6s wake-up ring (default: 60000 = 60s)
 ESCALATION_TIMEOUT_MS=60000
 
+# Stale-reply cooldown window in milliseconds (default: 30000 = 30s)
+STALE_REPLY_COOLDOWN_MS=30000
+
+# Optional: Pre-notification countdown in seconds before sending a WhatsApp prompt (default: 0)
+REMINDER_COUNTER=0
+
 # Optional: Quiet hours in HH:MM-HH:MM 24h local format (suppresses wake-up ring, e.g. 23:00-07:00)
 QUIET_HOURS=
+
+# Optional: SQLite database path (default: ./.hitl.sqlite)
+DB_PATH=./.hitl.sqlite
 ```
 
 ### 4. Link WhatsApp (One-Time QR Scan)
@@ -96,8 +113,8 @@ Add to `~/.gemini/config/mcp_config.json` (Antigravity), `.cursor/mcp.json`, or 
 
 ## Exposed MCP Tools
 
-1. **`request_approval`** — Creates the request, enforces the server-side risk floor, sends the WhatsApp text + Opus voice note (falling back to text-only if TTS fails), and waits for a terminal decision while emitting 15s MCP progress heartbeats.
-2. **`wait_for_approval`** — Resumes waiting on an existing active `request_id` without sending duplicate messages.
-3. **`cancel_approval`** — Explicitly cancels an active `request_id`, clears timers, and notifies the user on WhatsApp.
-4. **`get_approval_status`** — Returns the current persisted state and decision of `request_id` without blocking.
-5. **`request_human_input`** — Asks an open-ended question via WhatsApp text + voice note and returns the user's answer.
+1. **`request_approval`** (`project`, `summary`, `command_or_diff`, `spoken_prompt`, `risk_level`, `timeout_seconds`) — Creates the request, enforces the server-side risk floor, sends the WhatsApp text + Opus voice note (falling back to text-only if TTS fails), and waits for a terminal decision while emitting 15s MCP progress heartbeats.
+2. **`wait_for_approval`** (`request_id`) — Resumes waiting on an existing active `request_id` without sending duplicate messages.
+3. **`cancel_approval`** (`request_id`, `reason`) — Explicitly cancels an active `request_id`, clears timers, and notifies the user on WhatsApp.
+4. **`get_approval_status`** (`request_id`) — Returns the current persisted state and decision of `request_id` without blocking.
+5. **`request_human_input`** (`project`, `question`, `spoken_prompt`) — Asks an open-ended question via WhatsApp text + voice note and returns the user's answer.

@@ -5,77 +5,114 @@ export const RISK_LEVELS = Object.freeze({
   CRITICAL: 'CRITICAL',
 });
 
-const RISK_WEIGHT = Object.freeze({
-  LOW: 1,
-  MEDIUM: 2,
-  HIGH: 3,
-  CRITICAL: 4,
+export const RISK_RANK = Object.freeze({
+  LOW: 0,
+  MEDIUM: 1,
+  HIGH: 2,
+  CRITICAL: 3,
 });
 
-const WEIGHT_TO_RISK = Object.freeze({
-  1: 'LOW',
-  2: 'MEDIUM',
-  3: 'HIGH',
-  4: 'CRITICAL',
+const RANK_TO_RISK = Object.freeze({
+  0: 'LOW',
+  1: 'MEDIUM',
+  2: 'HIGH',
+  3: 'CRITICAL',
 });
 
 const CRITICAL_PATTERNS = [
+  // Destructive filesystem commands
   /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive\s+--force|-[a-zA-Z]*f[a-zA-Z]*r)\b/i,
+  /\bdel\s+(?:\/[fFsSqQ]\s*)+\b/i,
+  /\brmdir\s+\/[sS]\s+\/[qQ]\b/i,
+  /\bmkfs(?:\.[a-z0-9]+)?\b/i,
+  /\bdd\s+if=/i,
+  // Destructive DB operations
   /\bdrop\s+(table|database|schema)\b/i,
-  /\btruncate\s+table\b/i,
   /\btruncate\b/i,
+  // Force pushes & hard resets
   /\bgit\s+push\s+([^\n]*\s+)?(--force|-f|--force-with-lease)\b/i,
-  /\b(production\s+deploy|deploy\s+to\s+prod|prod\s+deployment|--prod\b)\b/i,
+  /\bgit\s+reset\s+--hard\b/i,
+  // Credential / secret mutations
   /\b(rotate|delete|overwrite|mutate|revoke)\s+(secret|credential|api[_\s-]?key|private[_\s-]?key|token)s?\b/i,
+  // Production deploys & destructive cloud operations
+  /\b(production\s+deploy|deploy\s+to\s+prod|prod\s+deployment|--prod\b)\b/i,
   /\baws\s+s3\s+(rb|rm)\b.*--force/i,
   /\bterraform\s+destroy\b/i,
   /\bkubectl\s+delete\s+(namespace|ns|deployment|statefulset|pvc|pv)\b/i,
 ];
 
 const HIGH_PATTERNS = [
+  // Database migrations
   /\b(migrate|migration|prisma|alembic|knex\s+migrate|typeorm\s+migration|flyway|liquibase)\b/i,
+  // Package publishing
   /\b(npm|pnpm|yarn)\s+publish\b/i,
-  /\b(docker|docker-compose|systemctl|service|chmod|chown|sudo|iptables|ufw|kubectl\s+apply)\b/i,
+  // Sudo / chmod / chown / Docker daemon mutations
+  /\b(sudo|chmod|chown)\b/i,
+  /\bdocker(?:-compose)?\s+(run|rm|rmi|stop|kill|exec|system\s+prune|down|up)\b/i,
+  /\bsystemctl\s+(stop|restart|disable|mask)\b/i,
   /\balter\s+table\b/i,
   /\bdelete\s+from\b/i,
 ];
 
 /**
- * Derives the minimum required risk level by inspecting `commandOrDiff` and `summary`,
- * then returns `MAX(agentRequestedRisk, serverDerivedRisk)`.
+ * Computes the effective risk level by inspecting `commandOrDiff`, `summary`, and `project`,
+ * returning `MAX(agentRisk, derivedRisk)` where `LOW (0) < MEDIUM (1) < HIGH (2) < CRITICAL (3)`.
  *
- * @param {object} params
- * @param {string} [params.agentRiskLevel]
- * @param {string} [params.commandOrDiff]
- * @param {string} [params.summary]
- * @returns {{ effectiveRiskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL', derivedRiskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL', escalated: boolean }}
+ * @param {string} [agentRisk='HIGH']
+ * @param {object} [context]
+ * @param {string} [context.summary]
+ * @param {string} [context.commandOrDiff]
+ * @param {string} [context.project]
+ * @returns {'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'}
+ */
+export function computeEffectiveRisk(
+  agentRisk = 'HIGH',
+  { summary = '', commandOrDiff = '', project = '' } = {}
+) {
+  const normalizedAgent = String(agentRisk || 'HIGH').toUpperCase();
+  const agentRank =
+    normalizedAgent in RISK_RANK ? RISK_RANK[normalizedAgent] : RISK_RANK.HIGH;
+
+  const combinedText = `${project || ''}\n${summary || ''}\n${commandOrDiff || ''}`;
+
+  let derivedRank = RISK_RANK.LOW;
+  if (CRITICAL_PATTERNS.some((re) => re.test(combinedText))) {
+    derivedRank = RISK_RANK.CRITICAL;
+  } else if (HIGH_PATTERNS.some((re) => re.test(combinedText))) {
+    derivedRank = RISK_RANK.HIGH;
+  }
+
+  const finalRank = Math.max(agentRank, derivedRank);
+  return RANK_TO_RISK[finalRank];
+}
+
+/**
+ * Evaluates risk policy and returns detailed breakdown (`effectiveRiskLevel`, `derivedRiskLevel`, `escalated`).
  */
 export function evaluateRiskPolicy({
   agentRiskLevel = 'HIGH',
   commandOrDiff = '',
   summary = '',
+  project = '',
 } = {}) {
-  const normalizedAgentRisk = String(agentRiskLevel || 'HIGH').toUpperCase();
-  const agentWeight = RISK_WEIGHT[normalizedAgentRisk] || RISK_WEIGHT.HIGH;
+  const normalizedAgent = String(agentRiskLevel || 'HIGH').toUpperCase();
+  const agentRank =
+    normalizedAgent in RISK_RANK ? RISK_RANK[normalizedAgent] : RISK_RANK.HIGH;
 
-  const combinedText = `${summary || ''}\n${commandOrDiff || ''}`;
-
-  let derivedWeight = RISK_WEIGHT.LOW;
-
-  if (CRITICAL_PATTERNS.some((re) => re.test(combinedText))) {
-    derivedWeight = RISK_WEIGHT.CRITICAL;
-  } else if (HIGH_PATTERNS.some((re) => re.test(combinedText))) {
-    derivedWeight = RISK_WEIGHT.HIGH;
-  }
-
-  const finalWeight = Math.max(agentWeight, derivedWeight);
-  const effectiveRiskLevel = WEIGHT_TO_RISK[finalWeight];
-  const derivedRiskLevel = WEIGHT_TO_RISK[derivedWeight];
+  const effectiveRiskLevel = computeEffectiveRisk(normalizedAgent, {
+    summary,
+    commandOrDiff,
+    project,
+  });
+  const derivedRiskLevel = computeEffectiveRisk('LOW', {
+    summary,
+    commandOrDiff,
+    project,
+  });
 
   return {
     effectiveRiskLevel,
     derivedRiskLevel,
-    escalated: finalWeight > agentWeight,
+    escalated: RISK_RANK[effectiveRiskLevel] > agentRank,
   };
 }
-
