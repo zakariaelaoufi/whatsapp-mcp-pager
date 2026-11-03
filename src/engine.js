@@ -8,29 +8,82 @@ const AFFIRMATIVE_PATTERNS = new Set([
   'yes',
   'yep',
   'yeah',
+  'yup',
   'approve',
   'approved',
   'ok',
   'okay',
   'confirm',
   'confirmed',
+  'go',
   'go ahead',
   'sure',
+  'alright',
   'lgtm',
   'proceed',
   'do it',
   'run it',
+  'execute',
+  'execute it',
+  'ship it',
   'yes run it',
   'yes go ahead',
   'okay go go',
+  'okay go proceed',
   'ok go ahead',
   'ok run it',
+]);
+
+const AFFIRMATIVE_CORE_WORDS = new Set([
+  'y',
+  'yes',
+  'yep',
+  'yeah',
+  'yup',
+  'ok',
+  'okay',
+  'sure',
+  'alright',
+  'approve',
+  'approved',
+  'confirm',
+  'confirmed',
+  'proceed',
+  'go',
+  'ahead',
+  'run',
+  'do',
+  'execute',
+  'ship',
+  'lgtm',
+]);
+
+const AFFIRMATIVE_FILLER_WORDS = new Set([
+  'it',
+  'that',
+  'this',
+  'now',
+  'please',
+  'thanks',
+  'thank',
+  'you',
+  'and',
+  'lets',
+  'sounds',
+  'looks',
+  'good',
+  'great',
+  'fine',
+  'by',
+  'me',
+  'i',
 ]);
 
 const NEGATIVE_PATTERNS = new Set([
   'n',
   'no',
   'nope',
+  'nah',
   'reject',
   'rejected',
   'cancel',
@@ -44,6 +97,43 @@ const NEGATIVE_PATTERNS = new Set([
   'no stop',
   'dont run it',
   'do not run it',
+]);
+
+const NEGATIVE_CORE_WORDS = new Set([
+  'n',
+  'no',
+  'nope',
+  'nah',
+  'reject',
+  'rejected',
+  'cancel',
+  'stop',
+  'abort',
+  'deny',
+  'denied',
+  'dont',
+  'not',
+  'never',
+]);
+
+const NEGATIVE_FILLER_WORDS = new Set([
+  'do',
+  'run',
+  'execute',
+  'proceed',
+  'go',
+  'ahead',
+  'it',
+  'that',
+  'this',
+  'now',
+  'please',
+  'thanks',
+  'thank',
+  'you',
+  'wait',
+  'hold',
+  'on',
 ]);
 
 /**
@@ -118,6 +208,23 @@ export function classifyDecision(decisionText) {
     )
   ) {
     return 'NEEDS_CLARIFICATION';
+  }
+
+  const words = normalized.split(' ').filter(Boolean);
+  if (words.length > 0 && words.length <= 10) {
+    const allAffirmative =
+      words.some((w) => AFFIRMATIVE_CORE_WORDS.has(w)) &&
+      words.every((w) => AFFIRMATIVE_CORE_WORDS.has(w) || AFFIRMATIVE_FILLER_WORDS.has(w));
+    if (allAffirmative) {
+      return 'APPROVE';
+    }
+
+    const allNegative =
+      words.some((w) => NEGATIVE_CORE_WORDS.has(w)) &&
+      words.every((w) => NEGATIVE_CORE_WORDS.has(w) || NEGATIVE_FILLER_WORDS.has(w));
+    if (allNegative) {
+      return 'REJECT';
+    }
   }
 
   return 'MODIFICATION_REQUESTED';

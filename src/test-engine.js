@@ -545,6 +545,15 @@ async function runTests() {
     assert.equal(parsedEmpty.requestId, 'AP-82F4');
     assert.equal(parsedEmpty.decisionText, '');
 
+    // Natural spoken voice note transcripts
+    assert.equal(classifyDecision('Okay, go, proceed.'), 'APPROVE');
+    assert.equal(classifyDecision('Yes, go ahead and run it please.'), 'APPROVE');
+    assert.equal(classifyDecision("No, stop, don't run that."), 'REJECT');
+    assert.equal(
+      classifyDecision('Yes, but run it on staging first.'),
+      'MODIFICATION_REQUESTED'
+    );
+
     // 11c. computeEffectiveRisk escalates properly
     assert.equal(
       computeEffectiveRisk('LOW', { summary: 'drop', commandOrDiff: 'DROP TABLE users' }),
