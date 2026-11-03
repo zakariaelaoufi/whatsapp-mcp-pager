@@ -18,6 +18,7 @@ const engine = new ApprovalEngine({
   provider,
   escalationTimeoutMs: config.escalationTimeoutMs,
   staleReplyCooldownMs: config.staleReplyCooldownMs,
+  countdownMs: config.countdownMs,
   quietHours: config.quietHours,
   reconcileOnInit: true, // Section 5.1: Mark orphaned active requests as EXPIRED_ON_SERVER_RESTART
 });

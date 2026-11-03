@@ -1,14 +1,3 @@
-import dotenv from 'dotenv';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PROJECT_ROOT = path.resolve(__dirname, '..');
-
-const dotenvResult = dotenv.config({ path: path.resolve(PROJECT_ROOT, '.env'), quiet: true });
-const parsedEnv = dotenvResult?.parsed || {};
-
 const SENSITIVE_ENV_KEYS = [
   'OPENAI_API_KEY',
   'GROQ_API_KEY',
@@ -21,24 +10,41 @@ const SENSITIVE_ENV_KEYS = [
   'AWS_SECRET_ACCESS_KEY',
 ];
 
+let registeredEnvMap = {};
+
+/**
+ * Registers parsed .env key-value pairs from config initialization so `redact.js`
+ * stays a pure module with zero filesystem side effects on import.
+ *
+ * @param {Record<string, string>} envMap
+ */
+export function registerEnvSecrets(envMap = {}) {
+  if (envMap && typeof envMap === 'object') {
+    registeredEnvMap = { ...registeredEnvMap, ...envMap };
+  }
+}
+
 function collectLiteralSecrets() {
   const secrets = new Set();
 
   for (const key of SENSITIVE_ENV_KEYS) {
-    const val = process.env[key]?.trim() || parsedEnv[key]?.trim();
+    const val = process.env[key]?.trim() || registeredEnvMap[key]?.trim();
     if (val && val.length >= 8 && val !== 'sk-proj-...') {
       secrets.add(val);
     }
   }
 
-  for (const [k, v] of Object.entries(parsedEnv)) {
-    if (
-      /(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|PRIVATE)/i.test(k) &&
-      typeof v === 'string' &&
-      v.trim().length >= 8 &&
-      v.trim() !== 'sk-proj-...'
-    ) {
-      secrets.add(v.trim());
+  for (const source of [registeredEnvMap, process.env]) {
+    if (!source || typeof source !== 'object') continue;
+    for (const [k, v] of Object.entries(source)) {
+      if (
+        /(?:^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|PRIVATE)(?:_|$)/i.test(k) &&
+        typeof v === 'string' &&
+        v.trim().length >= 8 &&
+        v.trim() !== 'sk-proj-...'
+      ) {
+        secrets.add(v.trim());
+      }
     }
   }
 

@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { redactAuditDetails, redactSecrets } from './redact.js';
+import { redactAuditDetails, redactSecrets, registerEnvSecrets } from './redact.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,8 +11,9 @@ export const PROJECT_ROOT = path.resolve(__dirname, '..');
 export const AUTH_DATA_PATH = path.resolve(PROJECT_ROOT, '.wwebjs_auth');
 export const STALE_REPLY_COOLDOWN_MS = 30000;
 
-// Load .env from project root; pass quiet: true so dotenv v17+ never writes to stdout
-dotenv.config({ path: path.resolve(PROJECT_ROOT, '.env'), quiet: true });
+// Load .env from project root once; pass quiet: true so dotenv v17+ never writes to stdout
+const dotenvResult = dotenv.config({ path: path.resolve(PROJECT_ROOT, '.env'), quiet: true });
+registerEnvSecrets(dotenvResult?.parsed || {});
 
 const envSchema = z.object({
   MY_WHATSAPP_ID: z.string().trim().default(''),
@@ -32,6 +33,15 @@ const envSchema = z.object({
     .trim()
     .optional()
     .transform((v) => Number.parseInt(v || '60000', 10) || 60000),
+  REMINDER_COUNTER: z
+    .string()
+    .trim()
+    .optional()
+    .transform((v) => {
+      if (v === undefined || v === '') return 0;
+      const parsedInt = Number.parseInt(v, 10);
+      return Number.isNaN(parsedInt) || parsedInt < 0 ? 0 : parsedInt;
+    }),
   STALE_REPLY_COOLDOWN_MS: z
     .string()
     .trim()
@@ -55,6 +65,8 @@ export const config = {
   twilioAuthToken: parsed.TWILIO_AUTH_TOKEN,
   twilioFromNumber: parsed.TWILIO_FROM_NUMBER,
   escalationTimeoutMs: parsed.ESCALATION_TIMEOUT_MS,
+  reminderCounterSeconds: parsed.REMINDER_COUNTER,
+  countdownMs: parsed.REMINDER_COUNTER * 1000,
   staleReplyCooldownMs:
     typeof parsed.STALE_REPLY_COOLDOWN_MS === 'number' && !Number.isNaN(parsed.STALE_REPLY_COOLDOWN_MS)
       ? parsed.STALE_REPLY_COOLDOWN_MS
@@ -69,7 +81,7 @@ export const config = {
  * Validates required configuration via Zod with clear human-readable error messages.
  * Uses console.error exclusively to preserve MCP stdio JSON-RPC integrity.
  */
-export function validateConfig({ requireOpenAI = true } = {}) {
+export function validateConfig({ requireOpenAI = true, silent = false } = {}) {
   const strictSchema = z
     .object({
       MY_WHATSAPP_ID: z
@@ -140,7 +152,9 @@ export function validateConfig({ requireOpenAI = true } = {}) {
   if (!result.success) {
     const issues = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`);
     const message = `[Config Error] Invalid environment configuration in .env:\n  - ${issues.join('\n  - ')}`;
-    console.error(message);
+    if (!silent) {
+      console.error(message);
+    }
     throw new Error(message);
   }
 }
